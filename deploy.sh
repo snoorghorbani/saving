@@ -42,21 +42,11 @@ if ! firebase projects:list >/dev/null 2>&1; then
   firebase login
 fi
 
-# ── Ensure a Firebase project is linked ──────────────────────
+# ── Ensure Firebase project is set ────────────────────────────
 
-if [ ! -f ".firebaserc" ]; then
-  warn "No Firebase project linked yet."
-  echo ""
-  echo "  1. Go to https://console.firebase.google.com and create a project"
-  echo "     (or reuse an existing one)."
-  echo "  2. Enable Firestore (Native mode) in the console."
-  echo ""
-  read -rp "Enter your Firebase project ID: " PROJECT_ID
-  if [ -z "$PROJECT_ID" ]; then
-    err "Project ID cannot be empty."
-  fi
-  firebase use --add "$PROJECT_ID"
-fi
+PROJECT_ID="soushians-4d02a"
+firebase use "$PROJECT_ID" --non-interactive 2>/dev/null || firebase use --add "$PROJECT_ID"
+log "Using Firebase project: $PROJECT_ID"
 
 # ── Install dependencies ─────────────────────────────────────
 

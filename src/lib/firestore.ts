@@ -13,7 +13,38 @@ import {
     onSnapshot,
     type Unsubscribe,
 } from 'firebase/firestore';
-import type { Expense, ExpenseEntry, Transaction, Goals } from '@/types';
+import type { Expense, ExpenseEntry, Transaction, Goals, Account, AccountType, Currency } from '@/types';
+
+// ─── Accounts (dynamic saving places) ────────────────
+
+export function addAccount(
+    userId: string,
+    account: Omit<Account, 'id' | 'createdAt'>
+) {
+    const ref = collection(db, 'users', userId, 'accounts');
+    return addDoc(ref, { ...account, createdAt: Timestamp.now() });
+}
+
+export function deleteAccount(userId: string, accountId: string) {
+    const ref = doc(db, 'users', userId, 'accounts', accountId);
+    return deleteDoc(ref);
+}
+
+export function subscribeToAccounts(
+    userId: string,
+    callback: (accounts: Account[]) => void
+): Unsubscribe {
+    const ref = collection(db, 'users', userId, 'accounts');
+    const q = query(ref, orderBy('createdAt', 'asc'));
+    return onSnapshot(q, (snapshot) => {
+        const accounts = snapshot.docs.map((d) => ({
+            id: d.id,
+            ...d.data(),
+            createdAt: d.data().createdAt?.toDate?.() ?? new Date(),
+        })) as Account[];
+        callback(accounts);
+    });
+}
 
 // ─── Expenses ─────────────────────────────────────────
 
@@ -105,6 +136,22 @@ export function addTransaction(
     });
 }
 
+export function updateTransaction(
+    userId: string,
+    transactionId: string,
+    data: Partial<Omit<Transaction, 'id' | 'createdAt'>>
+) {
+    const ref = doc(db, 'users', userId, 'transactions', transactionId);
+    const payload: Record<string, unknown> = { ...data };
+    if (data.date) payload.date = Timestamp.fromDate(data.date);
+    return updateDoc(ref, payload);
+}
+
+export function deleteTransaction(userId: string, transactionId: string) {
+    const ref = doc(db, 'users', userId, 'transactions', transactionId);
+    return deleteDoc(ref);
+}
+
 export function subscribeToTransactions(
     userId: string,
     callback: (transactions: Transaction[]) => void
@@ -115,8 +162,8 @@ export function subscribeToTransactions(
         const txns = snapshot.docs.map((d) => ({
             id: d.id,
             ...d.data(),
-            date: d.data().date?.toDate?.() ?? new Date(),
-            createdAt: d.data().createdAt?.toDate?.() ?? new Date(),
+            date: d.data().date?.toDate?.() ?? d.data().createdAt?.toDate?.() ?? new Date(0),
+            createdAt: d.data().createdAt?.toDate?.() ?? new Date(0),
         })) as Transaction[];
         callback(txns);
     });

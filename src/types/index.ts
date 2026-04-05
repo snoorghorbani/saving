@@ -1,5 +1,14 @@
 export type Frequency = 'weekly' | 'monthly' | 'yearly' | 'one-time';
 
+export type ExpenseKind = 'fixed-payment' | 'budget' | 'one-time' | 'future';
+
+export const EXPENSE_KINDS: { value: ExpenseKind; label: string; desc: string }[] = [
+    { value: 'fixed-payment', label: 'Fixed Payment', desc: 'Recurring bill (rent, subscriptions) — shows weekly impact' },
+    { value: 'budget', label: 'Weekly Budget', desc: 'Tracked spending (groceries, dining) — resets weekly with carryover' },
+    { value: 'one-time', label: 'One-Time', desc: 'Single payment — optionally schedule a due date' },
+    { value: 'future', label: 'Future Expense', desc: 'Estimated total with a deadline — divided across weeks, log payments as you go' },
+];
+
 export type Category =
     | 'Rent'
     | 'Groceries'
@@ -25,14 +34,23 @@ export const CATEGORIES: Category[] = [
 
 export const FREQUENCIES: Frequency[] = ['weekly', 'monthly', 'yearly', 'one-time'];
 
+export type Currency = 'OMR' | 'USD' | 'EUR' | 'TRY' | 'GBP' | 'AED' | 'SAR' | 'INR';
+
+export const CURRENCIES: Currency[] = ['OMR', 'USD', 'EUR', 'TRY', 'GBP', 'AED', 'SAR', 'INR'];
+
 export interface Expense {
     id: string;
+    kind: ExpenseKind;
     name: string;
-    amount: number;
+    amount: number;          // fixed payment amount, or 0 for budgets
     frequency: Frequency;
     category: Category;
     isUnexpected: boolean;
-    weeklyBudget: number | null;
+    weeklyBudget: number | null;  // weekly budget cap for 'budget' kind
+    dueDay: number | null;        // day of month (1-31) for monthly fixed payments
+    dueDate: string | null;       // ISO date string for scheduled one-time payments
+    estimatedTotal: number | null; // total estimated amount for 'future' kind
+    deadline: string | null;       // ISO date string deadline for 'future' kind
     createdAt: Date;
     notes: string;
 }
@@ -43,35 +61,23 @@ export interface ExpenseEntry {
     amount: number;
     date: Date;
     notes: string;
+    type?: 'purchase' | 'set-aside';
     createdAt: Date;
 }
 
-export type AccountId =
-    | 'omr-cash'
-    | 'usd-cash'
-    | 'isbank'
-    | 'ziraat-bank'
-    | 'dhofar-bank'
-    | 'upwork';
+export type AccountType = 'Cash' | 'Bank' | 'Online';
 
 export interface Account {
-    id: AccountId;
+    id: string;
     name: string;
-    type: 'Cash' | 'Bank' | 'Online';
+    type: AccountType;
+    currency: Currency;
+    createdAt: Date;
 }
-
-export const ACCOUNTS: Account[] = [
-    { id: 'omr-cash', name: 'OMR Cash', type: 'Cash' },
-    { id: 'usd-cash', name: 'USD Cash', type: 'Cash' },
-    { id: 'isbank', name: 'IsBank', type: 'Bank' },
-    { id: 'ziraat-bank', name: 'Ziraat Bank', type: 'Bank' },
-    { id: 'dhofar-bank', name: 'Dhofar Bank', type: 'Bank' },
-    { id: 'upwork', name: 'Upwork', type: 'Online' },
-];
 
 export interface Transaction {
     id: string;
-    accountId: AccountId;
+    accountId: string;
     amount: number;
     date: Date;
     notes: string;

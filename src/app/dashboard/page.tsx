@@ -7,10 +7,13 @@ import {
     subscribeToTransactions,
     subscribeToGoals,
     subscribeToExpenseEntries,
+    subscribeToAccounts,
+    addExpenseEntry,
+    deleteExpenseEntry,
 } from '@/lib/firestore';
-import type { Expense, ExpenseEntry, Transaction, Goals } from '@/types';
-import { ACCOUNTS } from '@/types';
-import { formatOMR, toWeekly } from '@/lib/utils';
+import type { Expense, ExpenseEntry, Transaction, Goals, ExpenseKind, Account } from '@/types';
+import { formatOMR, toWeekly, getWeekRange, isDueInWeek, getEffectiveBudget, futureWeeklyImpact, isFutureWeekPaid } from '@/lib/utils';
+import { formatCurrency, convert } from '@/lib/currency';
 import { ProgressBar } from '@/components/ProgressBar';
 
 export default function DashboardPage() {
@@ -19,6 +22,12 @@ export default function DashboardPage() {
     const [entries, setEntries] = useState<ExpenseEntry[]>([]);
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [goals, setGoals] = useState<Goals | null>(null);
+    const [accounts, setAccounts] = useState<Account[]>([]);
+    const [showTotalInUSD, setShowTotalInUSD] = useState(false);
+    const [convertedTotalOMR, setConvertedTotalOMR] = useState<number | null>(null);
+    const [convertedTotalUSD, setConvertedTotalUSD] = useState<number | null>(null);
+    const [convertedWeek, setConvertedWeek] = useState<number | null>(null);
+    const [convertedMonth, setConvertedMonth] = useState<number | null>(null);
 
     useEffect(() => {
         if (!user) return;
@@ -26,13 +35,50 @@ export default function DashboardPage() {
         const unsub2 = subscribeToTransactions(user.uid, setTransactions);
         const unsub3 = subscribeToGoals(user.uid, setGoals);
         const unsub4 = subscribeToExpenseEntries(user.uid, setEntries);
+        const unsub5 = subscribeToAccounts(user.uid, setAccounts);
         return () => {
             unsub1();
             unsub2();
             unsub3();
             unsub4();
+            unsub5();
         };
     }, [user]);
+
+    // Convert total savings to OMR and USD
+    useEffect(() => {
+        let cancelled = false;
+        async function calc() {
+            let totalOMR = 0;
+            let totalUSD = 0;
+            let weekOMR = 0;
+            let monthOMR = 0;
+            const now_ = new Date();
+            const weekStart = new Date(now_);
+            weekStart.setDate(now_.getDate() - now_.getDay());
+            weekStart.setHours(0, 0, 0, 0);
+            const monthStart = new Date(now_.getFullYear(), now_.getMonth(), 1);
+            const accountMap = new Map(accounts.map((a) => [a.id, a]));
+            for (const txn of transactions) {
+                const acc = accountMap.get(txn.accountId);
+                const currency = acc?.currency ?? 'OMR';
+                const inOMR = await convert(txn.amount, currency, 'OMR');
+                totalOMR += inOMR;
+                totalUSD += await convert(txn.amount, currency, 'USD');
+                if (txn.date >= weekStart) weekOMR += inOMR;
+                if (txn.date >= monthStart) monthOMR += inOMR;
+            }
+            if (!cancelled) {
+                setConvertedTotalOMR(totalOMR);
+                setConvertedTotalUSD(totalUSD);
+                setConvertedWeek(weekOMR);
+                setConvertedMonth(monthOMR);
+            }
+        }
+        calc();
+        return () => { cancelled = true; };
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [accounts, transactions]);
 
     const now = new Date();
     const startOfWeek = new Date(now);
@@ -42,17 +88,85 @@ export default function DashboardPage() {
     const regularExpenses = expenses.filter((e) => !e.isUnexpected);
     const unexpectedExpenses = expenses.filter((e) => e.isUnexpected);
 
+    // Backwards compat: old expenses without `kind` infer from fields
+    const getKind = (e: Expense): ExpenseKind =>
+        e.kind ?? (e.frequency === 'one-time' ? 'one-time' : e.weeklyBudget != null && e.amount <= 0 ? 'budget' : 'fixed-payment');
+
+    const fixedPayments = regularExpenses.filter((e) => getKind(e) === 'fixed-payment');
+    const budgetExpenses = regularExpenses.filter((e) => getKind(e) === 'budget');
+    const futureExpenses = regularExpenses.filter((e) => getKind(e) === 'future');
+    const futureImpact = futureExpenses.reduce((sum, e) => sum + futureWeeklyImpact(e), 0);
+
+    const thisWeek = getWeekRange(0);
+    const nextWeek = getWeekRange(1);
+
+    const thisWeekFixed = fixedPayments.filter((e) => isDueInWeek(e, thisWeek.start, thisWeek.end));
+    const nextWeekFixed = fixedPayments.filter((e) => isDueInWeek(e, nextWeek.start, nextWeek.end));
+
+    const isPaidInPeriod = (expense: Expense, weekStart: Date, weekEnd: Date): boolean => {
+        if (expense.frequency === 'weekly') {
+            return entries.some(
+                (e) => e.expenseId === expense.id && e.type !== 'set-aside' && e.date >= weekStart && e.date <= weekEnd
+            );
+        }
+        if (expense.frequency === 'monthly') {
+            const day = expense.dueDay ?? 1;
+            let refDate = new Date(weekStart.getFullYear(), weekStart.getMonth(), day);
+            if (refDate < weekStart || refDate > weekEnd) {
+                refDate = new Date(weekEnd.getFullYear(), weekEnd.getMonth(), day);
+            }
+            const monthStart = new Date(refDate.getFullYear(), refDate.getMonth(), 1);
+            const monthEnd = new Date(refDate.getFullYear(), refDate.getMonth() + 1, 0, 23, 59, 59, 999);
+            return entries.some(
+                (e) => e.expenseId === expense.id && e.type !== 'set-aside' && e.date >= monthStart && e.date <= monthEnd
+            );
+        }
+        return false;
+    };
+
+    const setAsideThisWeek = (expenseId: string) =>
+        entries
+            .filter((e) => e.expenseId === expenseId && e.type === 'set-aside' && e.date >= startOfWeek)
+            .reduce((sum, e) => sum + e.amount, 0);
+
+    const setAsideEntriesThisWeek = (expenseId: string) =>
+        entries.filter((e) => e.expenseId === expenseId && e.type === 'set-aside' && e.date >= startOfWeek);
+
+    const handleSetAside = async (expense: Expense) => {
+        if (!user) return;
+        const weeklyAmount = getKind(expense) === 'future'
+            ? futureWeeklyImpact(expense)
+            : toWeekly(expense.amount, expense.frequency);
+        if (!confirm(`Set aside ${formatOMR(weeklyAmount)} for "${expense.name}"?`)) return;
+        await addExpenseEntry(user.uid, {
+            expenseId: expense.id,
+            amount: weeklyAmount,
+            date: new Date(),
+            notes: 'Set aside',
+            type: 'set-aside',
+        });
+    };
+
+    const handleUndoSetAside = async (expense: Expense) => {
+        if (!user) return;
+        if (!confirm(`Undo set-aside for "${expense.name}"?`)) return;
+        const asideEntries = setAsideEntriesThisWeek(expense.id);
+        for (const entry of asideEntries) {
+            await deleteExpenseEntry(user.uid, entry.id);
+        }
+    };
+
     const spentThisWeek = (expenseId: string) =>
         entries
             .filter((e) => e.expenseId === expenseId && e.date >= startOfWeek)
             .reduce((sum, e) => sum + e.amount, 0);
 
+    const fixedWeeklyImpact = fixedPayments.reduce((sum, e) => sum + toWeekly(e.amount, e.frequency), 0);
+    const budgetTotalBase = budgetExpenses.reduce((sum, e) => sum + (e.weeklyBudget ?? 0), 0);
+    const budgetTotalSpent = budgetExpenses.reduce((sum, e) => sum + spentThisWeek(e.id), 0);
+    const weeklyBudgetTotal = fixedWeeklyImpact + budgetTotalBase + futureImpact;
     const weeklySpentTotal = regularExpenses.reduce(
         (sum, e) => sum + spentThisWeek(e.id),
-        0
-    );
-    const weeklyBudgetTotal = regularExpenses.reduce(
-        (sum, e) => sum + (e.weeklyBudget ?? toWeekly(e.amount, e.frequency)),
         0
     );
     const unexpectedTotal = unexpectedExpenses.reduce(
@@ -60,16 +174,59 @@ export default function DashboardPage() {
         0
     );
 
-    const totalSaved = transactions.reduce((sum, t) => sum + t.amount, 0);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
+    // ── This Week totals (all types) ─────────────────
+    const oneTimeExpenses = regularExpenses.filter((e) => getKind(e) === 'one-time');
+    const unpaidOneTime = oneTimeExpenses.filter((e) => !entries.some((en) => en.expenseId === e.id));
+    const paidOneTimeThisWeek = oneTimeExpenses.filter((e) =>
+        entries.some((en) => en.expenseId === e.id && en.date >= thisWeek.start && en.date <= thisWeek.end)
+    );
 
-    const savedThisWeek = transactions
-        .filter((t) => t.date >= startOfWeek)
-        .reduce((sum, t) => sum + t.amount, 0);
+    const thisWeekFixedExpected = thisWeekFixed.reduce((sum, e) => sum + e.amount, 0);
+    const thisWeekFixedPaid = thisWeekFixed
+        .filter((e) => isPaidInPeriod(e, thisWeek.start, thisWeek.end))
+        .reduce((sum, e) => sum + e.amount, 0);
 
-    const savedThisMonth = transactions
-        .filter((t) => t.date >= startOfMonth)
-        .reduce((sum, t) => sum + t.amount, 0);
+    const thisWeekBudgetEffective = budgetExpenses.reduce(
+        (sum, e) => sum + getEffectiveBudget(e, entries).effectiveBudget, 0
+    );
+
+    const thisWeekOneTimeExpected = unpaidOneTime.reduce((sum, e) => sum + e.amount, 0)
+        + paidOneTimeThisWeek.reduce((sum, e) => sum + e.amount, 0);
+
+    // Use fixedWeeklyImpact (all fixed payments prorated) instead of only due-this-week amounts
+    const thisWeekExpected = fixedWeeklyImpact + thisWeekBudgetEffective + thisWeekOneTimeExpected + futureImpact;
+    const fixedSetAsideThisWeek = fixedPayments
+        .filter((e) => !isDueInWeek(e, thisWeek.start, thisWeek.end))
+        .reduce((sum, e) => sum + setAsideThisWeek(e.id), 0);
+    const futureSetAsideThisWeek = futureExpenses.reduce((sum, e) => sum + setAsideThisWeek(e.id), 0);
+    const futureSpentThisWeek = futureExpenses.reduce((sum, e) => sum + spentThisWeek(e.id), 0);
+    const thisWeekSpent = thisWeekFixedPaid + fixedSetAsideThisWeek + budgetTotalSpent + paidOneTimeThisWeek.reduce((sum, e) => sum + e.amount, 0) + futureSpentThisWeek;
+    const thisWeekDiff = thisWeekExpected - thisWeekSpent; // positive = under budget, negative = over
+
+    // ── Next Week totals ─────────────────────────────
+    const nextWeekFixedExpected = nextWeekFixed.reduce((sum, e) => sum + e.amount, 0);
+    // Use fixedWeeklyImpact for next week too — all fixed payments have weekly impact
+    const nextWeekExpected = fixedWeeklyImpact + budgetTotalBase + unpaidOneTime.reduce((sum, e) => sum + e.amount, 0) + futureImpact;
+
+    const formatDateRange = (start: Date, end: Date) =>
+        `${start.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })} – ${end.toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`;
+
+    // ── Total known expenses until end of 2026 ───────
+    const endOf2026 = new Date(2026, 11, 31, 23, 59, 59, 999);
+    const weeksLeft = Math.max(0, Math.ceil((endOf2026.getTime() - now.getTime()) / (7 * 24 * 60 * 60 * 1000)));
+    const fixedTotalTillEnd = fixedPayments.reduce((sum, e) => sum + toWeekly(e.amount, e.frequency) * weeksLeft, 0);
+    const oneTimeTotalTillEnd = oneTimeExpenses
+        .filter((e) => !entries.some((en) => en.expenseId === e.id))
+        .reduce((sum, e) => sum + e.amount, 0);
+    const futureTotalTillEnd = futureExpenses.reduce((sum, e) => {
+        const total = e.estimatedTotal ?? 0;
+        const paid = entries.filter((en) => en.expenseId === e.id && en.type !== 'set-aside').reduce((s, en) => s + en.amount, 0);
+        return sum + Math.max(0, total - paid);
+    }, 0);
+    const totalExpensesTillEnd = fixedTotalTillEnd + oneTimeTotalTillEnd + futureTotalTillEnd;
+
+    const savedThisWeek = convertedWeek ?? 0;
+    const savedThisMonth = convertedMonth ?? 0;
 
     const weeklyProgress = goals?.weeklyTarget
         ? (savedThisWeek / goals.weeklyTarget) * 100
@@ -83,12 +240,19 @@ export default function DashboardPage() {
             <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
 
             {/* ── Summary Cards ─────────────────────────── */}
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-                <div className="card">
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+                <div
+                    className="card cursor-pointer hover:shadow-md transition-shadow"
+                    onClick={() => setShowTotalInUSD(!showTotalInUSD)}
+                >
                     <p className="text-sm text-slate-500">Total Saved</p>
                     <p className="text-2xl font-bold text-emerald-600">
-                        {formatOMR(totalSaved)}
+                        {showTotalInUSD
+                            ? (convertedTotalUSD !== null ? formatCurrency(convertedTotalUSD, 'USD') : '…')
+                            : (convertedTotalOMR !== null ? formatCurrency(convertedTotalOMR, 'OMR') : '…')
+                        }
                     </p>
+                    <p className="text-xs text-slate-400 mt-1">Tap to show in {showTotalInUSD ? 'OMR' : 'USD'}</p>
                 </div>
                 <div className="card">
                     <p className="text-sm text-slate-500">Weekly Expenses</p>
@@ -114,6 +278,15 @@ export default function DashboardPage() {
                     <p className="text-sm text-slate-500">Saved This Month</p>
                     <p className="text-2xl font-bold text-emerald-600">
                         {formatOMR(savedThisMonth)}
+                    </p>
+                </div>
+                <div className="card">
+                    <p className="text-sm text-slate-500">Expenses Till End of 2026</p>
+                    <p className="text-2xl font-bold text-red-600">
+                        {formatOMR(totalExpensesTillEnd)}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                        {weeksLeft} weeks · Fixed {formatOMR(fixedTotalTillEnd)} + One-time {formatOMR(oneTimeTotalTillEnd)} + Future {formatOMR(futureTotalTillEnd)}
                     </p>
                 </div>
             </div>
@@ -199,29 +372,50 @@ export default function DashboardPage() {
                     </p>
                 ) : (
                     <div className="space-y-3">
-                        {regularExpenses.map((expense) => {
-                            const budget = expense.weeklyBudget ?? toWeekly(expense.amount, expense.frequency);
-                            const spent = spentThisWeek(expense.id);
-                            const remaining = budget - spent;
-                            const pct = budget > 0 ? Math.min((spent / budget) * 100, 100) : 0;
+                        {fixedPayments.map((expense) => {
+                            const weeklyImpact = toWeekly(expense.amount, expense.frequency);
                             return (
-                                <div
-                                    key={expense.id}
-                                    className="border-b border-slate-50 pb-3"
-                                >
+                                <div key={expense.id} className="border-b border-slate-50 pb-3">
                                     <div className="flex items-center justify-between mb-1">
                                         <div>
-                                            <p className="text-sm font-medium text-slate-700">
-                                                {expense.name}
+                                            <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                            <p className="text-xs text-slate-400">{expense.category} · Fixed</p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-sm font-semibold text-slate-800">
+                                                {formatOMR(weeklyImpact)}<span className="text-xs text-slate-400">/wk</span>
                                             </p>
                                             <p className="text-xs text-slate-400">
-                                                {expense.category}
+                                                {formatOMR(expense.amount)}/{expense.frequency}
+                                            </p>
+                                        </div>
+                                    </div>
+                                </div>
+                            );
+                        })}
+                        {budgetExpenses.map((expense) => {
+                            const { baseBudget, carryover, effectiveBudget } = getEffectiveBudget(expense, entries);
+                            const spent = spentThisWeek(expense.id);
+                            const remaining = effectiveBudget - spent;
+                            const pct = effectiveBudget > 0 ? Math.min((spent / effectiveBudget) * 100, 100) : 0;
+                            return (
+                                <div key={expense.id} className="border-b border-slate-50 pb-3">
+                                    <div className="flex items-center justify-between mb-1">
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                            <p className="text-xs text-slate-400">
+                                                {expense.category} · Budget
+                                                {carryover !== 0 && (
+                                                    <span className={carryover > 0 ? ' text-emerald-500' : ' text-red-400'}>
+                                                        {' '}({carryover > 0 ? '+' : ''}{formatOMR(carryover)})
+                                                    </span>
+                                                )}
                                             </p>
                                         </div>
                                         <div className="text-right">
                                             <p className="text-sm font-semibold text-slate-800">
                                                 {formatOMR(spent)}
-                                                <span className="text-xs text-slate-400"> / {formatOMR(budget)}</span>
+                                                <span className="text-xs text-slate-400"> / {formatOMR(effectiveBudget)}</span>
                                             </p>
                                             <p className={`text-xs ${remaining >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
                                                 {remaining >= 0
@@ -232,16 +426,337 @@ export default function DashboardPage() {
                                     </div>
                                     <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden">
                                         <div
-                                            className={`h-full rounded-full transition-all duration-500 ${pct >= 100 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'
-                                                }`}
+                                            className={`h-full rounded-full transition-all duration-500 ${pct >= 100 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'}`}
                                             style={{ width: `${pct}%` }}
                                         />
                                     </div>
                                 </div>
                             );
                         })}
+                        {futureExpenses.map((expense) => {
+                            const impact = futureWeeklyImpact(expense);
+                            const totalPaid = entries.filter((e) => e.expenseId === expense.id && e.type !== 'set-aside').reduce((s, e) => s + e.amount, 0);
+                            const total = expense.estimatedTotal ?? 0;
+                            const pct = total > 0 ? Math.min((totalPaid / total) * 100, 100) : 0;
+                            return (
+                                <div key={expense.id} className="border-b border-slate-50 pb-3">
+                                    <div className="flex items-center justify-between mb-1">
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                            <p className="text-xs text-slate-400">{expense.category} · Future</p>
+                                        </div>
+                                        <div className="text-right">
+                                            <p className="text-sm font-semibold text-slate-800">
+                                                {formatOMR(impact)}<span className="text-xs text-slate-400">/wk</span>
+                                            </p>
+                                            <p className="text-xs text-blue-600">
+                                                {formatOMR(totalPaid)} / {formatOMR(total)} paid
+                                            </p>
+                                        </div>
+                                    </div>
+                                    <div className="h-1.5 rounded-full bg-slate-100 overflow-hidden">
+                                        <div className="h-full rounded-full transition-all duration-500 bg-blue-500" style={{ width: `${pct}%` }} />
+                                    </div>
+                                </div>
+                            );
+                        })}
                     </div>
                 )}
+            </div>
+
+            {/* ── This Week's Expected Expenses ─────────── */}
+            <div className="card">
+                <div className="flex items-center justify-between mb-1">
+                    <h3 className="font-semibold text-slate-800">
+                        This Week&apos;s Expenses
+                    </h3>
+                    <span className="text-xs text-slate-400">
+                        {formatDateRange(thisWeek.start, thisWeek.end)}
+                    </span>
+                </div>
+                {/* Status banner */}
+                <div className={`rounded-lg px-4 py-3 mb-4 ${thisWeekDiff > 0 ? 'bg-emerald-50 border border-emerald-200' :
+                        thisWeekDiff < 0 ? 'bg-red-50 border border-red-200' :
+                            'bg-slate-50 border border-slate-200'
+                    }`}>
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-xs text-slate-500">Expected</p>
+                            <p className="text-lg font-bold text-slate-800">{formatOMR(thisWeekExpected)}</p>
+                        </div>
+                        <div className="text-center">
+                            <p className="text-xs text-slate-500">Spent</p>
+                            <p className="text-lg font-bold text-slate-800">{formatOMR(thisWeekSpent)}</p>
+                        </div>
+                        <div className="text-right">
+                            <p className={`text-xs ${thisWeekDiff >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                                {thisWeekDiff >= 0 ? 'Under Budget' : 'Over Budget'}
+                            </p>
+                            <p className={`text-lg font-bold ${thisWeekDiff >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                                {thisWeekDiff >= 0 ? '' : '+'}{formatOMR(Math.abs(thisWeekDiff))}
+                            </p>
+                        </div>
+                    </div>
+                    {thisWeekExpected > 0 && (
+                        <div className="mt-2 h-2 rounded-full bg-white/60 overflow-hidden">
+                            <div
+                                className={`h-full rounded-full transition-all duration-500 ${thisWeekSpent > thisWeekExpected ? 'bg-red-500' :
+                                        thisWeekSpent > thisWeekExpected * 0.75 ? 'bg-amber-500' : 'bg-emerald-500'
+                                    }`}
+                                style={{ width: `${Math.min((thisWeekSpent / thisWeekExpected) * 100, 100)}%` }}
+                            />
+                        </div>
+                    )}
+                </div>
+
+                <div className="space-y-2">
+                    {/* Fixed payments — show ALL with weekly impact */}
+                    {fixedPayments.map((expense) => {
+                        const weeklyImpact = toWeekly(expense.amount, expense.frequency);
+                        const dueThisWeek = isDueInWeek(expense, thisWeek.start, thisWeek.end);
+                        const paid = dueThisWeek && isPaidInPeriod(expense, thisWeek.start, thisWeek.end);
+                        const aside = setAsideThisWeek(expense.id);
+                        const isSetAside = aside >= weeklyImpact * 0.99;
+                        return (
+                            <div key={expense.id} className={`flex items-center justify-between py-2 px-3 rounded-lg ${paid ? 'bg-emerald-50' : isSetAside ? 'bg-emerald-50' : dueThisWeek ? 'bg-amber-50' : 'bg-slate-50'
+                                }`}>
+                                <div>
+                                    <p className={`text-sm font-medium ${paid || isSetAside ? 'text-emerald-700' : 'text-slate-700'}`}>{expense.name}</p>
+                                    <p className="text-xs text-slate-400">
+                                        Fixed · {expense.category} · {formatOMR(expense.amount)}/{expense.frequency}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <div className="text-right">
+                                        <p className={`text-sm font-bold ${paid || isSetAside ? 'text-emerald-600' : 'text-slate-800'}`}>{formatOMR(weeklyImpact)}<span className="text-xs text-slate-400 font-normal">/wk</span></p>
+                                    </div>
+                                    {dueThisWeek ? (
+                                        <span className={`text-xs px-2 py-0.5 rounded-full ${paid ? 'text-emerald-600 bg-emerald-100' : 'text-amber-600 bg-amber-100'}`}>
+                                            {paid ? '✓ Paid' : `Due${expense.frequency === 'monthly' ? ` day ${expense.dueDay ?? 1}` : ''}`}
+                                        </span>
+                                    ) : isSetAside ? (
+                                        <button
+                                            onClick={() => handleUndoSetAside(expense)}
+                                            className="text-xs px-2 py-0.5 rounded-full text-emerald-600 bg-emerald-100 hover:bg-red-100 hover:text-red-600 transition-colors"
+                                        >
+                                            ✓ Set Aside
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={() => handleSetAside(expense)}
+                                            className="text-xs px-2 py-0.5 rounded-full text-blue-600 bg-blue-100 hover:bg-blue-200 transition-colors"
+                                        >
+                                            Set Aside
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {/* Budgets */}
+                    {budgetExpenses.map((expense) => {
+                        const { effectiveBudget, carryover } = getEffectiveBudget(expense, entries);
+                        const spent = spentThisWeek(expense.id);
+                        const remaining = effectiveBudget - spent;
+                        const pct = effectiveBudget > 0 ? Math.min((spent / effectiveBudget) * 100, 100) : 0;
+                        return (
+                            <div key={expense.id} className="py-2 px-3 rounded-lg bg-slate-50">
+                                <div className="flex items-center justify-between">
+                                    <div>
+                                        <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                        <p className="text-xs text-slate-400">
+                                            Budget · {expense.category}
+                                            {carryover !== 0 && (
+                                                <span className={carryover > 0 ? ' text-emerald-500' : ' text-red-400'}>
+                                                    {' '}({carryover > 0 ? '+' : ''}{formatOMR(carryover)})
+                                                </span>
+                                            )}
+                                        </p>
+                                    </div>
+                                    <div className="text-right">
+                                        <p className="text-sm font-bold text-slate-800">
+                                            {formatOMR(spent)} <span className="text-xs text-slate-400 font-normal">/ {formatOMR(effectiveBudget)}</span>
+                                        </p>
+                                        <p className={`text-xs ${remaining >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                                            {remaining >= 0 ? `${formatOMR(remaining)} left` : `${formatOMR(Math.abs(remaining))} over`}
+                                        </p>
+                                    </div>
+                                </div>
+                                <div className="mt-1.5 h-1.5 rounded-full bg-slate-200 overflow-hidden">
+                                    <div
+                                        className={`h-full rounded-full transition-all duration-500 ${pct >= 100 ? 'bg-red-500' : pct >= 75 ? 'bg-amber-500' : 'bg-emerald-500'}`}
+                                        style={{ width: `${pct}%` }}
+                                    />
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {/* One-time */}
+                    {paidOneTimeThisWeek.map((expense) => (
+                        <div key={expense.id} className="flex items-center justify-between py-2 px-3 rounded-lg bg-emerald-50">
+                            <div>
+                                <p className="text-sm font-medium text-emerald-700 line-through">{expense.name}</p>
+                                <p className="text-xs text-slate-400">One-time · {expense.category}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <p className="text-sm font-bold text-emerald-600">{formatOMR(expense.amount)}</p>
+                                <span className="text-xs text-emerald-600 bg-emerald-100 px-2 py-0.5 rounded-full">✓ Paid</span>
+                            </div>
+                        </div>
+                    ))}
+                    {unpaidOneTime.map((expense) => (
+                        <div key={expense.id} className="flex items-center justify-between py-2 px-3 rounded-lg bg-amber-50">
+                            <div>
+                                <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                <p className="text-xs text-slate-400">One-time · {expense.category}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                                <p className="text-sm font-bold text-slate-800">{formatOMR(expense.amount)}</p>
+                                <span className="text-xs text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full">Pending</span>
+                            </div>
+                        </div>
+                    ))}
+                    {/* Future expenses */}
+                    {futureExpenses.map((expense) => {
+                        const impact = futureWeeklyImpact(expense);
+                        const totalPaid = entries.filter((e) => e.expenseId === expense.id && e.type !== 'set-aside').reduce((s, e) => s + e.amount, 0);
+                        const total = expense.estimatedTotal ?? 0;
+                        const aside = setAsideThisWeek(expense.id);
+                        const isSetAside = aside >= impact * 0.99;
+                        const weekPaid = isFutureWeekPaid(expense, totalPaid, 0);
+                        return (
+                            <div key={expense.id} className={`flex items-center justify-between py-2 px-3 rounded-lg ${weekPaid || isSetAside ? 'bg-emerald-50' : 'bg-blue-50'}`}>
+                                <div>
+                                    <p className={`text-sm font-medium ${weekPaid || isSetAside ? 'text-emerald-700' : 'text-slate-700'}`}>{expense.name}</p>
+                                    <p className="text-xs text-slate-400">
+                                        Future · {expense.category} · {formatOMR(totalPaid)}/{formatOMR(total)}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <div className="text-right">
+                                        <p className={`text-sm font-bold ${weekPaid || isSetAside ? 'text-emerald-600' : 'text-slate-800'}`}>{formatOMR(impact)}<span className="text-xs text-slate-400 font-normal">/wk</span></p>
+                                    </div>
+                                    {weekPaid ? (
+                                        <span className="text-xs px-2 py-0.5 rounded-full text-emerald-600 bg-emerald-100">
+                                            ✓ Paid
+                                        </span>
+                                    ) : isSetAside ? (
+                                        <button
+                                            onClick={() => handleUndoSetAside(expense)}
+                                            className="text-xs px-2 py-0.5 rounded-full text-emerald-600 bg-emerald-100 hover:bg-red-100 hover:text-red-600 transition-colors"
+                                        >
+                                            ✓ Set Aside
+                                        </button>
+                                    ) : (
+                                        <button
+                                            onClick={() => handleSetAside(expense)}
+                                            className="text-xs px-2 py-0.5 rounded-full text-blue-600 bg-blue-100 hover:bg-blue-200 transition-colors"
+                                        >
+                                            Set Aside
+                                        </button>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {fixedPayments.length === 0 && budgetExpenses.length === 0 && oneTimeExpenses.length === 0 && futureExpenses.length === 0 && (
+                        <p className="text-sm text-slate-400">No expenses this week.</p>
+                    )}
+                </div>
+            </div>
+
+            {/* ── Next Week's Expected Expenses ────────── */}
+            <div className="card">
+                <div className="flex items-center justify-between mb-1">
+                    <h3 className="font-semibold text-slate-800">
+                        Next Week&apos;s Expenses
+                    </h3>
+                    <span className="text-xs text-slate-400">
+                        {formatDateRange(nextWeek.start, nextWeek.end)}
+                    </span>
+                </div>
+                <div className="rounded-lg px-4 py-3 mb-4 bg-slate-50 border border-slate-200">
+                    <div className="flex items-center justify-between">
+                        <div>
+                            <p className="text-xs text-slate-500">Expected Total</p>
+                            <p className="text-lg font-bold text-slate-800">{formatOMR(nextWeekExpected)}</p>
+                        </div>
+                        <div className="text-right">
+                            <p className="text-xs text-slate-400">
+                                {fixedPayments.length} fixed + {budgetExpenses.length} budget{budgetExpenses.length !== 1 ? 's' : ''}
+                                {nextWeekFixed.length > 0 && ` · ${nextWeekFixed.length} due`}
+                                {unpaidOneTime.length > 0 && ` + ${unpaidOneTime.length} pending`}
+                                {futureExpenses.length > 0 && ` + ${futureExpenses.length} future`}
+                            </p>
+                        </div>
+                    </div>
+                </div>
+
+                <div className="space-y-2">
+                    {fixedPayments.map((expense) => {
+                        const weeklyImpact = toWeekly(expense.amount, expense.frequency);
+                        const dueNextWeek = isDueInWeek(expense, nextWeek.start, nextWeek.end);
+                        return (
+                            <div key={expense.id} className={`flex items-center justify-between py-2 px-3 rounded-lg ${dueNextWeek ? 'bg-amber-50' : 'bg-slate-50'}`}>
+                                <div>
+                                    <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                    <p className="text-xs text-slate-400">
+                                        Fixed · {expense.category} · {formatOMR(expense.amount)}/{expense.frequency}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <p className="text-sm font-bold text-slate-800">{formatOMR(weeklyImpact)}<span className="text-xs text-slate-400 font-normal">/wk</span></p>
+                                    {dueNextWeek && (
+                                        <span className="text-xs text-amber-600 bg-amber-100 px-2 py-0.5 rounded-full">
+                                            Due{expense.frequency === 'monthly' ? ` day ${expense.dueDay ?? 1}` : ''}
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {budgetExpenses.map((expense) => (
+                        <div key={expense.id} className="flex items-center justify-between py-2 px-3 rounded-lg bg-slate-50">
+                            <div>
+                                <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                <p className="text-xs text-slate-400">Budget · {expense.category}</p>
+                            </div>
+                            <p className="text-sm font-bold text-slate-800">{formatOMR(expense.weeklyBudget ?? 0)}</p>
+                        </div>
+                    ))}
+                    {unpaidOneTime.map((expense) => (
+                        <div key={expense.id} className="flex items-center justify-between py-2 px-3 rounded-lg bg-slate-50">
+                            <div>
+                                <p className="text-sm font-medium text-slate-700">{expense.name}</p>
+                                <p className="text-xs text-slate-400">One-time · {expense.category}</p>
+                            </div>
+                            <p className="text-sm font-bold text-slate-800">{formatOMR(expense.amount)}</p>
+                        </div>
+                    ))}
+                    {futureExpenses.map((expense) => {
+                        const totalPaid = entries.filter((e) => e.expenseId === expense.id && e.type !== 'set-aside').reduce((s, e) => s + e.amount, 0);
+                        const nextWeekPaid = isFutureWeekPaid(expense, totalPaid, 1);
+                        return (
+                            <div key={expense.id} className={`flex items-center justify-between py-2 px-3 rounded-lg ${nextWeekPaid ? 'bg-emerald-50' : 'bg-blue-50'}`}>
+                                <div>
+                                    <p className={`text-sm font-medium ${nextWeekPaid ? 'text-emerald-700' : 'text-slate-700'}`}>{expense.name}</p>
+                                    <p className="text-xs text-slate-400">Future · {expense.category}</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    <p className={`text-sm font-bold ${nextWeekPaid ? 'text-emerald-600' : 'text-slate-800'}`}>{formatOMR(futureWeeklyImpact(expense))}<span className="text-xs text-slate-400 font-normal">/wk</span></p>
+                                    {nextWeekPaid && (
+                                        <span className="text-xs px-2 py-0.5 rounded-full text-emerald-600 bg-emerald-100">
+                                            ✓ Paid
+                                        </span>
+                                    )}
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {fixedPayments.length === 0 && budgetExpenses.length === 0 && unpaidOneTime.length === 0 && futureExpenses.length === 0 && (
+                        <p className="text-sm text-slate-400">No expenses expected next week.</p>
+                    )}
+                </div>
             </div>
 
             {/* ── Unexpected Expenses Alert ─────────────── */}
@@ -282,33 +797,30 @@ export default function DashboardPage() {
             {/* ── Account Balances ──────────────────────── */}
             <div className="card">
                 <h3 className="font-semibold text-slate-800 mb-4">Account Balances</h3>
-                <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                    {ACCOUNTS.map((account) => {
-                        const balance = transactions
-                            .filter((t) => t.accountId === account.id)
-                            .reduce((sum, t) => sum + t.amount, 0);
-                        return (
-                            <div
-                                key={account.id}
-                                className="rounded-lg border border-slate-100 p-4"
-                            >
-                                <div className="flex items-center justify-between">
-                                    <div>
-                                        <p className="text-sm font-medium text-slate-700">
-                                            {account.name}
+                {accounts.length === 0 ? (
+                    <p className="text-sm text-slate-400">No saving places created yet.</p>
+                ) : (
+                    <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                        {accounts.map((account) => {
+                            const balance = transactions
+                                .filter((t) => t.accountId === account.id)
+                                .reduce((sum, t) => sum + t.amount, 0);
+                            return (
+                                <div key={account.id} className="rounded-lg border border-slate-100 p-4">
+                                    <div className="flex items-center justify-between">
+                                        <div>
+                                            <p className="text-sm font-medium text-slate-700">{account.name}</p>
+                                            <p className="text-xs text-slate-400">{account.type} · {account.currency}</p>
+                                        </div>
+                                        <p className={`text-sm font-bold ${balance >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                                            {formatCurrency(balance, account.currency)}
                                         </p>
-                                        <p className="text-xs text-slate-400">{account.type}</p>
                                     </div>
-                                    <p
-                                        className={`text-sm font-bold ${balance >= 0 ? 'text-emerald-600' : 'text-red-500'}`}
-                                    >
-                                        {formatOMR(balance)}
-                                    </p>
                                 </div>
-                            </div>
-                        );
-                    })}
-                </div>
+                            );
+                        })}
+                    </div>
+                )}
             </div>
         </div>
     );
