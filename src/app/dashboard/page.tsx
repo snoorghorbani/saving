@@ -8,10 +8,12 @@ import {
     subscribeToGoals,
     subscribeToExpenseEntries,
     subscribeToAccounts,
+    subscribeToIncomeSettings,
+    setIncomeSettings,
     addExpenseEntry,
     deleteExpenseEntry,
 } from '@/lib/firestore';
-import type { Expense, ExpenseEntry, Transaction, Goals, ExpenseKind, Account } from '@/types';
+import type { Expense, ExpenseEntry, Transaction, Goals, ExpenseKind, Account, IncomeSettings } from '@/types';
 import { formatOMR, toWeekly, getWeekRange, isDueInWeek, getEffectiveBudget, futureWeeklyImpact, isFutureWeekPaid } from '@/lib/utils';
 import { formatCurrency, convert } from '@/lib/currency';
 import { ProgressBar } from '@/components/ProgressBar';
@@ -23,11 +25,19 @@ export default function DashboardPage() {
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [goals, setGoals] = useState<Goals | null>(null);
     const [accounts, setAccounts] = useState<Account[]>([]);
-    const [showTotalInUSD, setShowTotalInUSD] = useState(false);
+    const [income, setIncome] = useState<IncomeSettings | null>(null);
+    const [editingIncome, setEditingIncome] = useState(false);
+    const [incomeForm, setIncomeForm] = useState({ weeklyAmount: '550', weeksReceived: '5' });
+    const [showInUSD, setShowInUSD] = useState(false);
     const [convertedTotalOMR, setConvertedTotalOMR] = useState<number | null>(null);
     const [convertedTotalUSD, setConvertedTotalUSD] = useState<number | null>(null);
+    const [convertedDepositOMR, setConvertedDepositOMR] = useState<number | null>(null);
+    const [convertedDepositUSD, setConvertedDepositUSD] = useState<number | null>(null);
+    const [convertedSavingOMR, setConvertedSavingOMR] = useState<number | null>(null);
+    const [convertedSavingUSD, setConvertedSavingUSD] = useState<number | null>(null);
     const [convertedWeek, setConvertedWeek] = useState<number | null>(null);
     const [convertedMonth, setConvertedMonth] = useState<number | null>(null);
+    const [omrToUsdRate, setOmrToUsdRate] = useState<number | null>(null);
 
     useEffect(() => {
         if (!user) return;
@@ -36,21 +46,53 @@ export default function DashboardPage() {
         const unsub3 = subscribeToGoals(user.uid, setGoals);
         const unsub4 = subscribeToExpenseEntries(user.uid, setEntries);
         const unsub5 = subscribeToAccounts(user.uid, setAccounts);
+        const unsub6 = subscribeToIncomeSettings(user.uid, (inc) => {
+            if (inc && inc.currency !== 'OMR') {
+                // Migrate old USD income to OMR 550/wk
+                setIncomeSettings(user.uid, {
+                    weeklyAmount: 550,
+                    currency: 'OMR',
+                    startDate: inc.startDate,
+                    weeksReceived: inc.weeksReceived,
+                });
+                return; // will re-trigger via onSnapshot
+            }
+            setIncome(inc);
+            if (inc) {
+                setIncomeForm({
+                    weeklyAmount: String(inc.weeklyAmount),
+                    weeksReceived: String(inc.weeksReceived),
+                });
+            } else {
+                // First time — auto-save default income (550 OMR/wk × 5 weeks)
+                setIncomeSettings(user.uid, {
+                    weeklyAmount: 550,
+                    currency: 'OMR',
+                    startDate: new Date().toISOString(),
+                    weeksReceived: 5,
+                });
+            }
+        });
         return () => {
             unsub1();
             unsub2();
             unsub3();
             unsub4();
             unsub5();
+            unsub6();
         };
     }, [user]);
 
-    // Convert total savings to OMR and USD
+    // Convert total savings to OMR and USD (split by bucket)
     useEffect(() => {
         let cancelled = false;
         async function calc() {
             let totalOMR = 0;
             let totalUSD = 0;
+            let depositOMR = 0;
+            let depositUSD = 0;
+            let savingOMR = 0;
+            let savingUSD = 0;
             let weekOMR = 0;
             let monthOMR = 0;
             const now_ = new Date();
@@ -63,16 +105,26 @@ export default function DashboardPage() {
                 const acc = accountMap.get(txn.accountId);
                 const currency = acc?.currency ?? 'OMR';
                 const inOMR = await convert(txn.amount, currency, 'OMR');
+                const inUSD = await convert(txn.amount, currency, 'USD');
                 totalOMR += inOMR;
-                totalUSD += await convert(txn.amount, currency, 'USD');
+                totalUSD += inUSD;
+                if (txn.bucket === 'deposit') { depositOMR += inOMR; depositUSD += inUSD; }
+                else { savingOMR += inOMR; savingUSD += inUSD; }
                 if (txn.date >= weekStart) weekOMR += inOMR;
                 if (txn.date >= monthStart) monthOMR += inOMR;
             }
             if (!cancelled) {
                 setConvertedTotalOMR(totalOMR);
                 setConvertedTotalUSD(totalUSD);
+                setConvertedDepositOMR(depositOMR);
+                setConvertedDepositUSD(depositUSD);
+                setConvertedSavingOMR(savingOMR);
+                setConvertedSavingUSD(savingUSD);
                 setConvertedWeek(weekOMR);
                 setConvertedMonth(monthOMR);
+                // Cache OMR→USD rate for income/expenses conversion
+                const rate = await convert(1, 'OMR', 'USD');
+                setOmrToUsdRate(rate);
             }
         }
         calc();
@@ -228,6 +280,31 @@ export default function DashboardPage() {
     const savedThisWeek = convertedWeek ?? 0;
     const savedThisMonth = convertedMonth ?? 0;
 
+    // ── Income totals ────────────────────────────────
+    const totalIncome = income ? income.weeklyAmount * income.weeksReceived : 0;
+    // Total expenses spent so far (actual payments only, excluding set-asides)
+    const totalExpensesSpent = entries
+        .filter((e) => e.type !== 'set-aside')
+        .reduce((sum, e) => sum + e.amount, 0);
+    // Untracked = Income - Expenses - Saved - Deposit
+    const totalDepositOMR = convertedDepositOMR ?? 0;
+    const totalSavingOMR = convertedSavingOMR ?? 0;
+    const totalUntracked = totalIncome - totalExpensesSpent - totalSavingOMR - totalDepositOMR;
+
+    const handleSaveIncome = async () => {
+        if (!user) return;
+        const weeklyAmount = parseFloat(incomeForm.weeklyAmount);
+        const weeksReceived = parseInt(incomeForm.weeksReceived, 10);
+        if (isNaN(weeklyAmount) || isNaN(weeksReceived) || weeklyAmount <= 0 || weeksReceived < 0) return;
+        await setIncomeSettings(user.uid, {
+            weeklyAmount,
+            currency: 'OMR',
+            startDate: new Date().toISOString(),
+            weeksReceived,
+        });
+        setEditingIncome(false);
+    };
+
     const weeklyProgress = goals?.weeklyTarget
         ? (savedThisWeek / goals.weeklyTarget) * 100
         : 0;
@@ -237,23 +314,132 @@ export default function DashboardPage() {
 
     return (
         <div className="space-y-6">
-            <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
+            <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                    <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
+                    <button
+                        onClick={() => setShowInUSD(!showInUSD)}
+                        className={`text-xs px-3 py-1 rounded-lg font-medium transition-colors ${showInUSD ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'
+                            }`}
+                    >
+                        {showInUSD ? 'USD' : 'OMR'}
+                    </button>
+                </div>
+                <button
+                    onClick={() => setEditingIncome(!editingIncome)}
+                    className="text-xs px-3 py-1 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100 transition-colors"
+                >
+                    {editingIncome ? 'Cancel' : income ? 'Edit Income' : 'Set Income'}
+                </button>
+            </div>
+
+            {/* ── Income Edit Form ─────────────────────── */}
+            {editingIncome && (
+                <div className="card">
+                    <div className="grid gap-3 sm:grid-cols-2">
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Weekly Income (OMR)</label>
+                            <input
+                                type="number"
+                                value={incomeForm.weeklyAmount}
+                                onChange={(e) => setIncomeForm({ ...incomeForm, weeklyAmount: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                min="0"
+                                step="0.01"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Weeks Received So Far</label>
+                            <input
+                                type="number"
+                                value={incomeForm.weeksReceived}
+                                onChange={(e) => setIncomeForm({ ...incomeForm, weeksReceived: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                min="0"
+                            />
+                        </div>
+                    </div>
+                    <button
+                        onClick={handleSaveIncome}
+                        className="mt-3 w-full rounded-lg bg-blue-600 text-white px-4 py-2 text-sm font-medium hover:bg-blue-700 transition-colors"
+                    >
+                        Save Income Settings
+                    </button>
+                </div>
+            )}
+
+            {/* ── Top Row: Income / Expenses / Deposit / Saved / Net / Untracked */}
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-6">
+                {(() => {
+                    const cur = showInUSD ? 'USD' as const : 'OMR' as const;
+                    const r = showInUSD && omrToUsdRate ? omrToUsdRate : 1;
+                    const incomeVal = totalIncome * r;
+                    const expensesVal = totalExpensesSpent * r;
+                    const depositVal = showInUSD ? (convertedDepositUSD ?? null) : (convertedDepositOMR ?? null);
+                    const savingVal = showInUSD ? (convertedSavingUSD ?? null) : (convertedSavingOMR ?? null);
+                    const netVal = incomeVal - expensesVal;
+                    const untrackedVal = depositVal !== null && savingVal !== null ? incomeVal - expensesVal - savingVal - depositVal : null;
+                    return (
+                        <>
+                            <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-5">
+                                <p className="text-xs font-medium text-emerald-600 mb-1">Total Income</p>
+                                <p className="text-2xl font-bold text-emerald-700">
+                                    {formatCurrency(incomeVal, cur)}
+                                </p>
+                                <p className="text-xs text-emerald-500 mt-1">
+                                    {income ? `${formatCurrency(income.weeklyAmount * r, cur)}/wk × ${income.weeksReceived} wks` : 'Not set'}
+                                </p>
+                            </div>
+                            <div className="rounded-xl border border-red-200 bg-red-50 p-5">
+                                <p className="text-xs font-medium text-red-600 mb-1">Total Expenses</p>
+                                <p className="text-2xl font-bold text-red-700">
+                                    {formatCurrency(expensesVal, cur)}
+                                </p>
+                                <p className="text-xs text-red-500 mt-1">All logged entries</p>
+                            </div>
+                            <div className="rounded-xl border border-blue-200 bg-blue-50 p-5">
+                                <p className="text-xs font-medium text-blue-600 mb-1">Total Deposit</p>
+                                <p className="text-2xl font-bold text-blue-700">
+                                    {depositVal !== null ? formatCurrency(depositVal, cur) : '…'}
+                                </p>
+                                <p className="text-xs text-blue-500 mt-1">Across all accounts</p>
+                            </div>
+                            <div className="rounded-xl border border-teal-200 bg-teal-50 p-5">
+                                <p className="text-xs font-medium text-teal-600 mb-1">Total Saved</p>
+                                <p className="text-2xl font-bold text-teal-700">
+                                    {savingVal !== null ? formatCurrency(savingVal, cur) : '…'}
+                                </p>
+                                <p className="text-xs text-teal-500 mt-1">Saving buckets only</p>
+                            </div>
+                            <div className={`rounded-xl p-5 border ${netVal >= 0 ? 'bg-blue-50 border-blue-200' : 'bg-amber-50 border-amber-200'}`}>
+                                <p className={`text-xs font-medium mb-1 ${netVal >= 0 ? 'text-blue-600' : 'text-amber-600'}`}>
+                                    Net (Income − Expenses)
+                                </p>
+                                <p className={`text-2xl font-bold ${netVal >= 0 ? 'text-blue-700' : 'text-amber-700'}`}>
+                                    {formatCurrency(netVal, cur)}
+                                </p>
+                                <p className={`text-xs mt-1 ${netVal >= 0 ? 'text-blue-500' : 'text-amber-500'}`}>
+                                    {netVal >= 0 ? 'Positive balance' : 'Over budget'}
+                                </p>
+                            </div>
+                            <div className={`rounded-xl p-5 border ${(untrackedVal ?? 0) >= 0 ? 'bg-purple-50 border-purple-200' : 'bg-red-50 border-red-200'}`}>
+                                <p className={`text-xs font-medium mb-1 ${(untrackedVal ?? 0) >= 0 ? 'text-purple-600' : 'text-red-600'}`}>
+                                    Untracked
+                                </p>
+                                <p className={`text-2xl font-bold ${(untrackedVal ?? 0) >= 0 ? 'text-purple-700' : 'text-red-700'}`}>
+                                    {untrackedVal !== null ? formatCurrency(untrackedVal, cur) : '…'}
+                                </p>
+                                <p className={`text-xs mt-1 ${(untrackedVal ?? 0) >= 0 ? 'text-purple-500' : 'text-red-500'}`}>
+                                    Income − Expenses − Saved − Deposit
+                                </p>
+                            </div>
+                        </>
+                    );
+                })()}
+            </div>
 
             {/* ── Summary Cards ─────────────────────────── */}
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
-                <div
-                    className="card cursor-pointer hover:shadow-md transition-shadow"
-                    onClick={() => setShowTotalInUSD(!showTotalInUSD)}
-                >
-                    <p className="text-sm text-slate-500">Total Saved</p>
-                    <p className="text-2xl font-bold text-emerald-600">
-                        {showTotalInUSD
-                            ? (convertedTotalUSD !== null ? formatCurrency(convertedTotalUSD, 'USD') : '…')
-                            : (convertedTotalOMR !== null ? formatCurrency(convertedTotalOMR, 'OMR') : '…')
-                        }
-                    </p>
-                    <p className="text-xs text-slate-400 mt-1">Tap to show in {showTotalInUSD ? 'OMR' : 'USD'}</p>
-                </div>
+            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="card">
                     <p className="text-sm text-slate-500">Weekly Expenses</p>
                     <p className="text-2xl font-bold text-slate-800">
@@ -476,8 +662,8 @@ export default function DashboardPage() {
                 </div>
                 {/* Status banner */}
                 <div className={`rounded-lg px-4 py-3 mb-4 ${thisWeekDiff > 0 ? 'bg-emerald-50 border border-emerald-200' :
-                        thisWeekDiff < 0 ? 'bg-red-50 border border-red-200' :
-                            'bg-slate-50 border border-slate-200'
+                    thisWeekDiff < 0 ? 'bg-red-50 border border-red-200' :
+                        'bg-slate-50 border border-slate-200'
                     }`}>
                     <div className="flex items-center justify-between">
                         <div>
@@ -501,7 +687,7 @@ export default function DashboardPage() {
                         <div className="mt-2 h-2 rounded-full bg-white/60 overflow-hidden">
                             <div
                                 className={`h-full rounded-full transition-all duration-500 ${thisWeekSpent > thisWeekExpected ? 'bg-red-500' :
-                                        thisWeekSpent > thisWeekExpected * 0.75 ? 'bg-amber-500' : 'bg-emerald-500'
+                                    thisWeekSpent > thisWeekExpected * 0.75 ? 'bg-amber-500' : 'bg-emerald-500'
                                     }`}
                                 style={{ width: `${Math.min((thisWeekSpent / thisWeekExpected) * 100, 100)}%` }}
                             />

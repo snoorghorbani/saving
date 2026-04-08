@@ -13,7 +13,7 @@ import {
     onSnapshot,
     type Unsubscribe,
 } from 'firebase/firestore';
-import type { Expense, ExpenseEntry, Transaction, Goals, Account, AccountType, Currency } from '@/types';
+import type { Expense, ExpenseEntry, Transaction, Goals, Account, AccountType, Currency, IncomeSettings } from '@/types';
 
 // ─── Accounts (dynamic saving places) ────────────────
 
@@ -162,6 +162,7 @@ export function subscribeToTransactions(
         const txns = snapshot.docs.map((d) => ({
             id: d.id,
             ...d.data(),
+            bucket: d.data().bucket ?? 'saving',
             date: d.data().date?.toDate?.() ?? d.data().createdAt?.toDate?.() ?? new Date(0),
             createdAt: d.data().createdAt?.toDate?.() ?? new Date(0),
         })) as Transaction[];
@@ -183,5 +184,22 @@ export function subscribeToGoals(
     const ref = doc(db, 'users', userId, 'goals', 'current');
     return onSnapshot(ref, (snapshot) => {
         callback(snapshot.exists() ? (snapshot.data() as Goals) : null);
+    });
+}
+
+// ─── Income Settings ─────────────────────────────────
+
+export function setIncomeSettings(userId: string, income: IncomeSettings) {
+    const ref = doc(db, 'users', userId, 'settings', 'income');
+    return setDoc(ref, income);
+}
+
+export function subscribeToIncomeSettings(
+    userId: string,
+    callback: (income: IncomeSettings | null) => void
+): Unsubscribe {
+    const ref = doc(db, 'users', userId, 'settings', 'income');
+    return onSnapshot(ref, (snapshot) => {
+        callback(snapshot.exists() ? (snapshot.data() as IncomeSettings) : null);
     });
 }

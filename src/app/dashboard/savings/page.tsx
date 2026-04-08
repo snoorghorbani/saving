@@ -11,10 +11,9 @@ import {
     addAccount,
     deleteAccount,
 } from '@/lib/firestore';
-import type { Transaction, Account, AccountType, Currency } from '@/types';
+import type { Transaction, Account, AccountType, Currency, Bucket } from '@/types';
 import { CURRENCIES } from '@/types';
 import { formatCurrency, convert } from '@/lib/currency';
-import { formatOMR } from '@/lib/utils';
 
 export default function SavingsPage() {
     const { user } = useAuth();
@@ -30,6 +29,7 @@ export default function SavingsPage() {
     // Transaction form state
     const [editingTxnId, setEditingTxnId] = useState<string | null>(null);
     const [accountId, setAccountId] = useState('');
+    const [bucket, setBucket] = useState<Bucket>('saving');
     const [amount, setAmount] = useState('');
     const [date, setDate] = useState(new Date().toISOString().slice(0, 10));
     const [notes, setNotes] = useState('');
@@ -41,7 +41,9 @@ export default function SavingsPage() {
 
     // Transfer form state
     const [transferFrom, setTransferFrom] = useState('');
+    const [transferFromBucket, setTransferFromBucket] = useState<Bucket>('deposit');
     const [transferTo, setTransferTo] = useState('');
+    const [transferToBucket, setTransferToBucket] = useState<Bucket>('saving');
     const [transferAmount, setTransferAmount] = useState('');
     const [transferDate, setTransferDate] = useState(new Date().toISOString().slice(0, 10));
     const [transferNotes, setTransferNotes] = useState('');
@@ -61,11 +63,13 @@ export default function SavingsPage() {
         }
     }, [accounts, accountId]);
 
-    // Compute per-account balances
-    const balanceOf = (accId: string) =>
-        transactions.filter((t) => t.accountId === accId).reduce((sum, t) => sum + t.amount, 0);
+    // Compute per-account bucket balances
+    const balanceOf = (accId: string, b?: Bucket) =>
+        transactions
+            .filter((t) => t.accountId === accId && (b ? t.bucket === b : true))
+            .reduce((sum, t) => sum + t.amount, 0);
 
-    // Convert total to display currency (include orphaned transactions as OMR)
+    // Convert total to display currency
     useEffect(() => {
         let cancelled = false;
         async function calc() {
@@ -90,6 +94,7 @@ export default function SavingsPage() {
             await updateTransaction(user.uid, editingTxnId, {
                 accountId,
                 amount: parseFloat(amount),
+                bucket,
                 date: new Date(date),
                 notes,
             });
@@ -98,6 +103,7 @@ export default function SavingsPage() {
             await addTransaction(user.uid, {
                 accountId,
                 amount: parseFloat(amount),
+                bucket,
                 date: new Date(date),
                 notes,
             });
@@ -110,6 +116,7 @@ export default function SavingsPage() {
     const handleEditTxn = (txn: Transaction) => {
         setEditingTxnId(txn.id);
         setAccountId(txn.accountId);
+        setBucket(txn.bucket);
         setAmount(txn.amount.toString());
         setDate(txn.date.toISOString().slice(0, 10));
         setNotes(txn.notes);
@@ -138,9 +145,9 @@ export default function SavingsPage() {
 
     // Set default transfer accounts
     useEffect(() => {
-        if (accounts.length >= 2) {
+        if (accounts.length >= 1) {
             if (!transferFrom) setTransferFrom(accounts[0].id);
-            if (!transferTo) setTransferTo(accounts[1].id);
+            if (!transferTo) setTransferTo(accounts.length >= 2 ? accounts[1].id : accounts[0].id);
         }
     }, [accounts, transferFrom, transferTo]);
 
@@ -162,26 +169,30 @@ export default function SavingsPage() {
         return () => { cancelled = true; };
     }, [transferFrom, transferTo, transferAmount, accounts]);
 
+    const isSameTarget = transferFrom === transferTo && transferFromBucket === transferToBucket;
+
     const handleTransfer = async (e: React.FormEvent) => {
         e.preventDefault();
-        if (!user || !transferFrom || !transferTo || !transferAmount || transferFrom === transferTo) return;
+        if (!user || !transferFrom || !transferTo || !transferAmount || isSameTarget) return;
         const fromAcc = accounts.find((a) => a.id === transferFrom);
         const toAcc = accounts.find((a) => a.id === transferTo);
         if (!fromAcc || !toAcc) return;
         const amt = parseFloat(transferAmount);
         if (isNaN(amt) || amt <= 0) return;
         const convertedAmt = await convert(amt, fromAcc.currency, toAcc.currency);
-        const label = `Transfer: ${fromAcc.name} → ${toAcc.name}`;
-        if (!confirm(`Transfer ${formatCurrency(amt, fromAcc.currency)} from ${fromAcc.name} → ${formatCurrency(convertedAmt, toAcc.currency)} to ${toAcc.name}?`)) return;
+        const label = `Transfer: ${fromAcc.name}/${transferFromBucket} → ${toAcc.name}/${transferToBucket}`;
+        if (!confirm(`Transfer ${formatCurrency(amt, fromAcc.currency)} from ${fromAcc.name} (${transferFromBucket}) → ${formatCurrency(convertedAmt, toAcc.currency)} to ${toAcc.name} (${transferToBucket})?`)) return;
         await addTransaction(user.uid, {
             accountId: transferFrom,
             amount: -amt,
+            bucket: transferFromBucket,
             date: new Date(transferDate),
             notes: transferNotes || label,
         });
         await addTransaction(user.uid, {
             accountId: transferTo,
             amount: convertedAmt,
+            bucket: transferToBucket,
             date: new Date(transferDate),
             notes: transferNotes || label,
         });
@@ -227,11 +238,11 @@ export default function SavingsPage() {
                     <button
                         onClick={() => { setShowTransferForm(!showTransferForm); setShowForm(false); }}
                         className="btn-secondary"
-                        disabled={accounts.length < 2}
+                        disabled={accounts.length < 1}
                     >
                         Transfer
                     </button>
-                    <button onClick={() => { setEditingTxnId(null); setAmount(''); setNotes(''); setDate(new Date().toISOString().slice(0, 10)); setShowForm(!showForm); setShowTransferForm(false); }} className="btn-primary">
+                    <button onClick={() => { setEditingTxnId(null); setAmount(''); setNotes(''); setDate(new Date().toISOString().slice(0, 10)); setBucket('saving'); setShowForm(!showForm); setShowTransferForm(false); }} className="btn-primary">
                         + Transaction
                     </button>
                 </div>
@@ -268,28 +279,42 @@ export default function SavingsPage() {
                 </div>
             )}
 
-            {/* ── Transaction Form ─────────────────────── */}
+            {/* ── Transfer Form ────────────────────────── */}
             {showTransferForm && (
                 <div className="card">
-                    <h2 className="text-lg font-semibold text-slate-800 mb-4">Transfer Between Accounts</h2>
-                    {accounts.length < 2 ? (
-                        <p className="text-sm text-slate-400">You need at least 2 accounts to transfer.</p>
+                    <h2 className="text-lg font-semibold text-slate-800 mb-4">Transfer</h2>
+                    {accounts.length < 1 ? (
+                        <p className="text-sm text-slate-400">Create an account first.</p>
                     ) : (
                         <form onSubmit={handleTransfer} className="grid gap-4 sm:grid-cols-2">
                             <div>
-                                <label className="label">From</label>
+                                <label className="label">From Account</label>
                                 <select className="select w-full" value={transferFrom} onChange={(e) => setTransferFrom(e.target.value)}>
                                     {accounts.map((a) => (
-                                        <option key={a.id} value={a.id}>{a.name} ({a.currency}) — {formatCurrency(balanceOf(a.id), a.currency)}</option>
+                                        <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>
                                     ))}
                                 </select>
                             </div>
                             <div>
-                                <label className="label">To</label>
+                                <label className="label">From Bucket</label>
+                                <select className="select w-full" value={transferFromBucket} onChange={(e) => setTransferFromBucket(e.target.value as Bucket)}>
+                                    <option value="deposit">Deposit — {formatCurrency(balanceOf(transferFrom, 'deposit'), accounts.find(a => a.id === transferFrom)?.currency ?? 'OMR')}</option>
+                                    <option value="saving">Saving — {formatCurrency(balanceOf(transferFrom, 'saving'), accounts.find(a => a.id === transferFrom)?.currency ?? 'OMR')}</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label className="label">To Account</label>
                                 <select className="select w-full" value={transferTo} onChange={(e) => setTransferTo(e.target.value)}>
-                                    {accounts.filter((a) => a.id !== transferFrom).map((a) => (
-                                        <option key={a.id} value={a.id}>{a.name} ({a.currency}) — {formatCurrency(balanceOf(a.id), a.currency)}</option>
+                                    {accounts.map((a) => (
+                                        <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>
                                     ))}
+                                </select>
+                            </div>
+                            <div>
+                                <label className="label">To Bucket</label>
+                                <select className="select w-full" value={transferToBucket} onChange={(e) => setTransferToBucket(e.target.value as Bucket)}>
+                                    <option value="deposit">Deposit — {formatCurrency(balanceOf(transferTo, 'deposit'), accounts.find(a => a.id === transferTo)?.currency ?? 'OMR')}</option>
+                                    <option value="saving">Saving — {formatCurrency(balanceOf(transferTo, 'saving'), accounts.find(a => a.id === transferTo)?.currency ?? 'OMR')}</option>
                                 </select>
                             </div>
                             <div>
@@ -310,8 +335,9 @@ export default function SavingsPage() {
                                 <input type="text" className="input w-full" value={transferNotes} onChange={(e) => setTransferNotes(e.target.value)} placeholder="Optional" />
                             </div>
                             <div className="sm:col-span-2 flex gap-2">
-                                <button type="submit" className="btn-primary" disabled={transferFrom === transferTo}>Transfer</button>
+                                <button type="submit" className="btn-primary" disabled={isSameTarget}>Transfer</button>
                                 <button type="button" onClick={() => setShowTransferForm(false)} className="btn-secondary">Cancel</button>
+                                {isSameTarget && <p className="text-xs text-red-500 self-center">Source and destination must differ</p>}
                             </div>
                         </form>
                     )}
@@ -335,6 +361,13 @@ export default function SavingsPage() {
                                 </select>
                             </div>
                             <div>
+                                <label className="label">Bucket</label>
+                                <select className="select w-full" value={bucket} onChange={(e) => setBucket(e.target.value as Bucket)}>
+                                    <option value="deposit">Deposit</option>
+                                    <option value="saving">Saving</option>
+                                </select>
+                            </div>
+                            <div>
                                 <label className="label">Amount ({selectedAccount?.currency ?? ''})</label>
                                 <input type="number" step="0.001" className="input w-full" value={amount} onChange={(e) => setAmount(e.target.value)} placeholder="Negative for withdrawal" required />
                                 <p className="text-xs text-slate-400 mt-1">Use negative amount for withdrawals</p>
@@ -343,7 +376,7 @@ export default function SavingsPage() {
                                 <label className="label">Date</label>
                                 <input type="date" className="input w-full" value={date} onChange={(e) => setDate(e.target.value)} required />
                             </div>
-                            <div>
+                            <div className="sm:col-span-2">
                                 <label className="label">Notes</label>
                                 <input type="text" className="input w-full" value={notes} onChange={(e) => setNotes(e.target.value)} placeholder="Optional" />
                             </div>
@@ -365,7 +398,9 @@ export default function SavingsPage() {
             ) : (
                 <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {accounts.map((account) => {
-                        const balance = balanceOf(account.id);
+                        const depositBal = balanceOf(account.id, 'deposit');
+                        const savingBal = balanceOf(account.id, 'saving');
+                        const total = depositBal + savingBal;
                         const txnCount = transactions.filter((t) => t.accountId === account.id).length;
                         return (
                             <div
@@ -387,9 +422,17 @@ export default function SavingsPage() {
                                         >✕</button>
                                     </div>
                                 </div>
-                                <p className={`text-xl font-bold ${balance >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
-                                    {formatCurrency(balance, account.currency)}
+                                <p className={`text-xl font-bold ${total >= 0 ? 'text-emerald-600' : 'text-red-500'}`}>
+                                    {formatCurrency(total, account.currency)}
                                 </p>
+                                <div className="flex gap-4 mt-1">
+                                    <p className="text-xs text-slate-500">
+                                        Deposit: <span className={depositBal >= 0 ? 'text-blue-600 font-medium' : 'text-red-500 font-medium'}>{formatCurrency(depositBal, account.currency)}</span>
+                                    </p>
+                                    <p className="text-xs text-slate-500">
+                                        Saving: <span className={savingBal >= 0 ? 'text-emerald-600 font-medium' : 'text-red-500 font-medium'}>{formatCurrency(savingBal, account.currency)}</span>
+                                    </p>
+                                </div>
                                 <p className="text-xs text-slate-400 mt-1">{txnCount} transaction{txnCount !== 1 ? 's' : ''}</p>
                             </div>
                         );
@@ -417,7 +460,12 @@ export default function SavingsPage() {
                             return (
                                 <div key={txn.id} className="flex items-center justify-between border-b border-slate-50 pb-2">
                                     <div>
-                                        <p className="text-sm font-medium text-slate-700">{account?.name ?? 'Unknown'}</p>
+                                        <p className="text-sm font-medium text-slate-700">
+                                            {account?.name ?? 'Unknown'}
+                                            <span className={`ml-1 text-xs px-1.5 py-0.5 rounded ${txn.bucket === 'saving' ? 'bg-emerald-50 text-emerald-600' : 'bg-blue-50 text-blue-600'}`}>
+                                                {txn.bucket}
+                                            </span>
+                                        </p>
                                         <p className="text-xs text-slate-400">
                                             {txn.date.toLocaleDateString()}
                                             {txn.notes && ` · ${txn.notes}`}

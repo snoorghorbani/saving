@@ -1,16 +1,16 @@
 'use client';
 
 import { useAuth } from '@/lib/auth-context';
-import { useRouter } from 'next/navigation';
 import { useEffect } from 'react';
 
 export default function Home() {
     const { user, loading, signInWithGoogle } = useAuth();
-    const router = useRouter();
 
     useEffect(() => {
-        if (!loading && user) router.replace('/dashboard');
-    }, [user, loading, router]);
+        if (!loading && user) {
+            window.location.href = '/dashboard';
+        }
+    }, [user, loading]);
 
     if (loading) {
         return (

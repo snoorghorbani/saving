@@ -75,10 +75,13 @@ export interface Account {
     createdAt: Date;
 }
 
+export type Bucket = 'deposit' | 'saving';
+
 export interface Transaction {
     id: string;
     accountId: string;
     amount: number;
+    bucket: Bucket;
     date: Date;
     notes: string;
     createdAt: Date;
@@ -87,4 +90,11 @@ export interface Transaction {
 export interface Goals {
     weeklyTarget: number;
     monthlyTarget: number;
+}
+
+export interface IncomeSettings {
+    weeklyAmount: number;
+    currency: Currency;
+    startDate: string; // ISO date string — first week of income
+    weeksReceived: number; // total weeks of income received so far
 }

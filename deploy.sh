@@ -30,10 +30,7 @@ if ! command -v firebase >/dev/null 2>&1; then
   npm install -g firebase-tools
 fi
 
-# ── Enable web-frameworks experiment (needed for Next.js SSR) ─
-
-log "Enabling Firebase web-frameworks experiment..."
-firebase experiments:enable webframeworks 2>/dev/null || true
+# ── Static export — no Cloud Functions needed ────────────────
 
 # ── Authenticate (interactive — opens browser) ───────────────
 
@@ -60,7 +57,10 @@ firebase deploy --only firestore:rules
 
 # ── Build & deploy the Next.js app ───────────────────────────
 
-log "Building and deploying to Firebase Hosting..."
+log "Building Next.js static export..."
+npm run build
+
+log "Deploying to Firebase Hosting..."
 firebase deploy --only hosting
 
 echo ""

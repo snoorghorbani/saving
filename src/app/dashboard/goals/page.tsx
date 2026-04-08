@@ -6,18 +6,23 @@ import {
     subscribeToGoals,
     setGoals,
     subscribeToTransactions,
+    subscribeToAccounts,
 } from '@/lib/firestore';
-import type { Goals, Transaction } from '@/types';
+import type { Goals, Transaction, Account } from '@/types';
 import { formatOMR } from '@/lib/utils';
+import { formatCurrency, convert } from '@/lib/currency';
 import { ProgressBar } from '@/components/ProgressBar';
 
 export default function GoalsPage() {
     const { user } = useAuth();
     const [goals, setGoalsState] = useState<Goals | null>(null);
     const [transactions, setTransactions] = useState<Transaction[]>([]);
+    const [accounts, setAccounts] = useState<Account[]>([]);
     const [weeklyTarget, setWeeklyTarget] = useState('');
     const [monthlyTarget, setMonthlyTarget] = useState('');
     const [editing, setEditing] = useState(false);
+    const [convertedWeek, setConvertedWeek] = useState<number | null>(null);
+    const [convertedMonth, setConvertedMonth] = useState<number | null>(null);
 
     useEffect(() => {
         if (!user) return;
@@ -29,11 +34,41 @@ export default function GoalsPage() {
             }
         });
         const unsub2 = subscribeToTransactions(user.uid, setTransactions);
+        const unsub3 = subscribeToAccounts(user.uid, setAccounts);
         return () => {
             unsub1();
             unsub2();
+            unsub3();
         };
     }, [user]);
+
+    // Convert savings to OMR for accurate totals across currencies
+    useEffect(() => {
+        let cancelled = false;
+        async function calc() {
+            const now_ = new Date();
+            const weekStart = new Date(now_);
+            weekStart.setDate(now_.getDate() - now_.getDay());
+            weekStart.setHours(0, 0, 0, 0);
+            const monthStart = new Date(now_.getFullYear(), now_.getMonth(), 1);
+            const accountMap = new Map(accounts.map((a) => [a.id, a]));
+            let weekOMR = 0;
+            let monthOMR = 0;
+            for (const txn of transactions) {
+                const acc = accountMap.get(txn.accountId);
+                const currency = acc?.currency ?? 'OMR';
+                const inOMR = await convert(txn.amount, currency, 'OMR');
+                if (txn.date >= weekStart) weekOMR += inOMR;
+                if (txn.date >= monthStart) monthOMR += inOMR;
+            }
+            if (!cancelled) {
+                setConvertedWeek(weekOMR);
+                setConvertedMonth(monthOMR);
+            }
+        }
+        calc();
+        return () => { cancelled = true; };
+    }, [accounts, transactions]);
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -45,19 +80,8 @@ export default function GoalsPage() {
         setEditing(false);
     };
 
-    const now = new Date();
-    const startOfWeek = new Date(now);
-    startOfWeek.setDate(now.getDate() - now.getDay());
-    startOfWeek.setHours(0, 0, 0, 0);
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
-
-    const savedThisWeek = transactions
-        .filter((t) => t.date >= startOfWeek)
-        .reduce((sum, t) => sum + t.amount, 0);
-
-    const savedThisMonth = transactions
-        .filter((t) => t.date >= startOfMonth)
-        .reduce((sum, t) => sum + t.amount, 0);
+    const savedThisWeek = convertedWeek ?? 0;
+    const savedThisMonth = convertedMonth ?? 0;
 
     const weeklyProgress = goals?.weeklyTarget
         ? (savedThisWeek / goals.weeklyTarget) * 100
