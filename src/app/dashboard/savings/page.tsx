@@ -819,6 +819,59 @@ export default function SavingsPage() {
                                     </p>
                                 </div>
                                 <p className="text-xs text-slate-400 mt-1">{txnCount} transaction{txnCount !== 1 ? 's' : ''}</p>
+                                {account.cards && account.cards.length > 0 && (
+                                    <div className="flex flex-wrap gap-1 mt-1.5">
+                                        {account.cards.map((c) => (
+                                            <span key={c} className="text-[10px] font-mono bg-slate-100 text-slate-500 px-1.5 py-0.5 rounded">•••• {c}</span>
+                                        ))}
+                                    </div>
+                                )}
+                                {!isViewer && (
+                                    <div className="mt-2 flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+                                        <input
+                                            id={`card-input-${account.id}`}
+                                            type="text"
+                                            inputMode="numeric"
+                                            placeholder="Add card (last 4)"
+                                            maxLength={4}
+                                            className="w-28 text-xs rounded border border-slate-200 px-2 py-1"
+                                            onKeyDown={async (e) => {
+                                                if (e.key !== 'Enter') return;
+                                                e.preventDefault();
+                                                const input = e.currentTarget;
+                                                const val = input.value.trim();
+                                                if (!/^\d{4}$/.test(val)) return;
+                                                if (account.cards?.includes(val)) { input.value = ''; return; }
+                                                await updateAccount(user!.uid, account.id, { cards: [...(account.cards || []), val] });
+                                                input.value = '';
+                                            }}
+                                        />
+                                        <button
+                                            type="button"
+                                            onClick={async () => {
+                                                const input = document.getElementById(`card-input-${account.id}`) as HTMLInputElement;
+                                                if (!input) return;
+                                                const val = input.value.trim();
+                                                if (!/^\d{4}$/.test(val)) return;
+                                                if (account.cards?.includes(val)) { input.value = ''; return; }
+                                                await updateAccount(user!.uid, account.id, { cards: [...(account.cards || []), val] });
+                                                input.value = '';
+                                            }}
+                                            className="text-[10px] px-1.5 py-1 rounded bg-blue-50 text-blue-600 hover:bg-blue-100"
+                                        >+Add</button>
+                                        {account.cards?.map((c) => (
+                                            <button
+                                                key={c}
+                                                onClick={async (e) => {
+                                                    e.stopPropagation();
+                                                    await updateAccount(user!.uid, account.id, { cards: (account.cards || []).filter((x) => x !== c) });
+                                                }}
+                                                className="text-[10px] text-red-400 hover:text-red-600"
+                                                title={`Remove card ${c}`}
+                                            >✕{c}</button>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         );
                     })}

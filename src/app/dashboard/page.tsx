@@ -18,8 +18,11 @@ import {
     subscribeToViewers,
     getSmsApiKey,
     setSmsApiKey,
+    getSmsSettings,
+    setSmsAccountId,
     subscribeToLoans,
     subscribeToLoanRepayments,
+    addTransaction,
 } from '@/lib/firestore';
 import type { Expense, ExpenseEntry, Transaction, Goals, ExpenseKind, Account, IncomeSettings, Loan, LoanRepayment } from '@/types';
 import { formatOMR, toWeekly, getWeekRange, isDueInWeek, getEffectiveBudget, futureWeeklyImpact, isFutureWeekPaid } from '@/lib/utils';
@@ -35,7 +38,7 @@ export default function DashboardPage() {
     const [accounts, setAccounts] = useState<Account[]>([]);
     const [income, setIncome] = useState<IncomeSettings | null>(null);
     const [editingIncome, setEditingIncome] = useState(false);
-    const [incomeForm, setIncomeForm] = useState({ weeklyAmount: '550', weeksReceived: '5' });
+    const [incomeForm, setIncomeForm] = useState({ weeklyAmount: '550', startDate: '2026-03-01', depositAccountId: '' });
     const [showInUSD, setShowInUSD] = useState(false);
     const [convertedTotalOMR, setConvertedTotalOMR] = useState<number | null>(null);
     const [convertedTotalUSD, setConvertedTotalUSD] = useState<number | null>(null);
@@ -55,8 +58,11 @@ export default function DashboardPage() {
     const [showExpenseBreakdown, setShowExpenseBreakdown] = useState(false);
     const [showSmsSetup, setShowSmsSetup] = useState(false);
     const [smsApiKey, setSmsApiKeyState] = useState<string | null>(null);
+    const [smsAccountId, setSmsAccountIdState] = useState<string>('');
     const [loans, setLoans] = useState<Loan[]>([]);
     const [loanRepayments, setLoanRepayments] = useState<LoanRepayment[]>([]);
+    const [showRecordIncome, setShowRecordIncome] = useState(false);
+    const [recordIncomeForm, setRecordIncomeForm] = useState({ accountId: '', amount: '', date: new Date().toISOString().slice(0, 10), notes: '' });
 
     useEffect(() => {
         if (!effectiveUserId) return;
@@ -82,15 +88,16 @@ export default function DashboardPage() {
             if (inc) {
                 setIncomeForm({
                     weeklyAmount: String(inc.weeklyAmount),
-                    weeksReceived: String(inc.weeksReceived),
+                    startDate: inc.startDate ? new Date(inc.startDate).toISOString().slice(0, 10) : '2026-03-01',
+                    depositAccountId: inc.depositAccountId ?? '',
                 });
             } else if (!isViewer && user) {
-                // First time — auto-save default income (550 OMR/wk × 5 weeks)
+                // First time — auto-save default income (550 OMR/wk, starting March 1 2026)
                 setIncomeSettings(user.uid, {
                     weeklyAmount: 550,
                     currency: 'OMR',
-                    startDate: new Date().toISOString(),
-                    weeksReceived: 5,
+                    startDate: '2026-03-01T00:00:00.000Z',
+                    weeksReceived: 0,
                 });
             }
         });
@@ -116,7 +123,10 @@ export default function DashboardPage() {
     // Load SMS API key when panel is opened
     useEffect(() => {
         if (!showSmsSetup || !user || isViewer) return;
-        getSmsApiKey(user.uid).then(setSmsApiKeyState);
+        getSmsSettings(user.uid).then(({ key, accountId }) => {
+            setSmsApiKeyState(key);
+            setSmsAccountIdState(accountId ?? '');
+        });
     }, [showSmsSetup, user, isViewer]);
 
     // Convert total savings to OMR and USD (split by bucket)
@@ -327,7 +337,11 @@ export default function DashboardPage() {
     const savedThisMonth = convertedMonth ?? 0;
 
     // ── Income totals ────────────────────────────────
-    const totalIncome = income ? income.weeklyAmount * income.weeksReceived : 0;
+    // Auto-calculate weeks received from startDate
+    const weeksReceived = income?.startDate
+        ? Math.max(0, Math.floor((Date.now() - new Date(income.startDate).getTime()) / (7 * 24 * 60 * 60 * 1000)))
+        : 0;
+    const totalIncome = income ? income.weeklyAmount * weeksReceived : 0;
     // Total expenses spent so far (actual payments only, excluding set-asides)
     const totalExpensesSpent = entries
         .filter((e) => e.type !== 'set-aside')
@@ -363,16 +377,31 @@ export default function DashboardPage() {
         });
     };
 
+    const handleRecordIncome = async () => {
+        if (!user || isViewer) return;
+        const amount = parseFloat(recordIncomeForm.amount);
+        if (isNaN(amount) || amount <= 0 || !recordIncomeForm.accountId) return;
+        await addTransaction(user.uid, {
+            accountId: recordIncomeForm.accountId,
+            amount,
+            bucket: 'deposit' as const,
+            date: new Date(recordIncomeForm.date + 'T00:00:00'),
+            notes: recordIncomeForm.notes || 'Weekly income',
+        });
+        setShowRecordIncome(false);
+        setRecordIncomeForm({ accountId: '', amount: '', date: new Date().toISOString().slice(0, 10), notes: '' });
+    };
+
     const handleSaveIncome = async () => {
         if (!user || isViewer) return;
         const weeklyAmount = parseFloat(incomeForm.weeklyAmount);
-        const weeksReceived = parseInt(incomeForm.weeksReceived, 10);
-        if (isNaN(weeklyAmount) || isNaN(weeksReceived) || weeklyAmount <= 0 || weeksReceived < 0) return;
+        if (isNaN(weeklyAmount) || weeklyAmount <= 0 || !incomeForm.startDate) return;
         await setIncomeSettings(user.uid, {
             weeklyAmount,
             currency: 'OMR',
-            startDate: new Date().toISOString(),
-            weeksReceived,
+            startDate: new Date(incomeForm.startDate).toISOString(),
+            weeksReceived: 0, // legacy field, now auto-calculated from startDate
+            ...(incomeForm.depositAccountId ? { depositAccountId: incomeForm.depositAccountId } : {}),
         });
         setEditingIncome(false);
     };
@@ -412,6 +441,19 @@ export default function DashboardPage() {
                             className="text-xs px-3 py-1 rounded-lg bg-purple-50 text-purple-600 hover:bg-purple-100 transition-colors"
                         >
                             {showSharing ? 'Hide Sharing' : 'Sharing'}
+                        </button>
+                    )}
+                    {!isViewer && (
+                        <button
+                            onClick={() => {
+                                setShowRecordIncome(!showRecordIncome);
+                                if (!showRecordIncome && income) {
+                                    setRecordIncomeForm((f) => ({ ...f, amount: String(income.weeklyAmount), date: new Date().toISOString().slice(0, 10) }));
+                                }
+                            }}
+                            className="text-xs px-3 py-1 rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100 transition-colors"
+                        >
+                            {showRecordIncome ? 'Cancel' : '💰 Record Income'}
                         </button>
                     )}
                     {!isViewer && (
@@ -531,6 +573,25 @@ export default function DashboardPage() {
                             </code>
                         </div>
 
+                        <div>
+                            <label className="text-xs font-medium text-slate-600">Default Deduct Account (fallback)</label>
+                            <select
+                                value={smsAccountId}
+                                onChange={async (e) => {
+                                    if (!user) return;
+                                    setSmsAccountIdState(e.target.value);
+                                    await setSmsAccountId(user.uid, e.target.value);
+                                }}
+                                className="mt-1 w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                            >
+                                <option value="">None (don&apos;t deduct)</option>
+                                {accounts.map((a) => (
+                                    <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>
+                                ))}
+                            </select>
+                            <p className="text-xs text-slate-400 mt-1">Used only when no card number is detected. Add card last-4-digits to accounts on the Savings page for auto-matching.</p>
+                        </div>
+
                         <div className="bg-amber-50 rounded-lg p-3 border border-amber-200">
                             <p className="text-xs font-semibold text-amber-800 mb-2">iOS Shortcut Setup</p>
                             <ol className="text-xs text-amber-700 space-y-1 list-decimal list-inside">
@@ -543,6 +604,64 @@ export default function DashboardPage() {
                             </ol>
                         </div>
                     </div>
+                </div>
+            )}
+
+            {/* ── Record Income Form ──────────────────── */}
+            {!isViewer && showRecordIncome && (
+                <div className="card">
+                    <h3 className="font-semibold text-slate-800 mb-3">Record Weekly Income</h3>
+                    <div className="grid gap-3 sm:grid-cols-2">
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Account</label>
+                            <select
+                                value={recordIncomeForm.accountId}
+                                onChange={(e) => setRecordIncomeForm({ ...recordIncomeForm, accountId: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                            >
+                                <option value="">Select account…</option>
+                                {accounts.map((a) => (
+                                    <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>
+                                ))}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Amount</label>
+                            <input
+                                type="number"
+                                value={recordIncomeForm.amount}
+                                onChange={(e) => setRecordIncomeForm({ ...recordIncomeForm, amount: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                min="0"
+                                step="0.001"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Date</label>
+                            <input
+                                type="date"
+                                value={recordIncomeForm.date}
+                                onChange={(e) => setRecordIncomeForm({ ...recordIncomeForm, date: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                            />
+                        </div>
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">Notes</label>
+                            <input
+                                type="text"
+                                value={recordIncomeForm.notes}
+                                onChange={(e) => setRecordIncomeForm({ ...recordIncomeForm, notes: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                                placeholder="Weekly income"
+                            />
+                        </div>
+                    </div>
+                    <button
+                        onClick={handleRecordIncome}
+                        className="mt-3 w-full rounded-lg bg-emerald-600 text-white px-4 py-2 text-sm font-medium hover:bg-emerald-700 transition-colors"
+                    >
+                        Record Deposit
+                    </button>
                 </div>
             )}
 
@@ -562,14 +681,28 @@ export default function DashboardPage() {
                             />
                         </div>
                         <div>
-                            <label className="text-xs text-slate-500 mb-1 block">Weeks Received So Far</label>
+                            <label className="text-xs text-slate-500 mb-1 block">Income Start Date</label>
                             <input
-                                type="number"
-                                value={incomeForm.weeksReceived}
-                                onChange={(e) => setIncomeForm({ ...incomeForm, weeksReceived: e.target.value })}
+                                type="date"
+                                value={incomeForm.startDate}
+                                onChange={(e) => setIncomeForm({ ...incomeForm, startDate: e.target.value })}
                                 className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
-                                min="0"
                             />
+                            <p className="text-xs text-slate-400 mt-1">Auto-calculated: {weeksReceived} weeks since start</p>
+                        </div>
+                        <div className="sm:col-span-2">
+                            <label className="text-xs text-slate-500 mb-1 block">Auto-Deposit Account</label>
+                            <select
+                                value={incomeForm.depositAccountId}
+                                onChange={(e) => setIncomeForm({ ...incomeForm, depositAccountId: e.target.value })}
+                                className="w-full rounded-lg border border-slate-200 px-3 py-2 text-sm"
+                            >
+                                <option value="">None (manual only)</option>
+                                {accounts.map((a) => (
+                                    <option key={a.id} value={a.id}>{a.name} ({a.currency})</option>
+                                ))}
+                            </select>
+                            <p className="text-xs text-slate-400 mt-1">Weekly income will be auto-deposited to this account every Friday</p>
                         </div>
                     </div>
                     <button
@@ -600,7 +733,7 @@ export default function DashboardPage() {
                                     {formatCurrency(incomeVal, cur)}
                                 </p>
                                 <p className="text-xs text-emerald-500 mt-1">
-                                    {income ? `${formatCurrency(income.weeklyAmount * r, cur)}/wk × ${income.weeksReceived} wks` : 'Not set'}
+                                    {income ? `${formatCurrency(income.weeklyAmount * r, cur)}/wk × ${weeksReceived} wks` : 'Not set'}
                                 </p>
                             </div>
                             <div className="rounded-xl border border-red-200 bg-red-50 p-5">

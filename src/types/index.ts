@@ -74,6 +74,7 @@ export interface Account {
     type: AccountType;
     currency: Currency;
     isExternal?: boolean;      // true → not funded by tracked income (excluded from untracked calc)
+    cards?: string[];          // last 4 digits of linked payment cards
     createdAt: Date;
 }
 
@@ -100,6 +101,7 @@ export interface IncomeSettings {
     currency: Currency;
     startDate: string; // ISO date string — first week of income
     weeksReceived: number; // total weeks of income received so far
+    depositAccountId?: string; // account that receives auto weekly income deposits
 }
 
 export interface ViewerAccess {

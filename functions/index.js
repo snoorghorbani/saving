@@ -1,6 +1,7 @@
 import { onRequest } from "firebase-functions/v2/https";
+import { onSchedule } from "firebase-functions/v2/scheduler";
 import { initializeApp } from "firebase-admin/app";
-import { getFirestore, Timestamp } from "firebase-admin/firestore";
+import { getFirestore, Timestamp, FieldValue } from "firebase-admin/firestore";
 import { GoogleGenAI } from "@google/genai";
 
 initializeApp();
@@ -16,6 +17,7 @@ Return a JSON object with exactly these fields:
 - "currency": string (e.g. "OMR", "USD", "AED". Use "OMR" if "RO" is mentioned)
 - "merchant": string or null (the merchant/store name only, without "POS -" prefix)
 - "date": string in "YYYY-MM-DD" format, or null if not found. Today is ${today}.
+- "cardLast4": string or null (the last 4 digits of the card/account used, e.g. "7592")
 
 SMS: "${text}"`;
 
@@ -37,6 +39,7 @@ SMS: "${text}"`;
         amount: typeof parsed.amount === "number" ? parsed.amount : null,
         currency: parsed.currency || "OMR",
         merchant: parsed.merchant || null,
+        cardLast4: parsed.cardLast4 || null,
         date: parsedDate,
         raw: text,
     };
@@ -137,12 +140,44 @@ export const parseSms = onRequest(
                     createdAt: Timestamp.now(),
                 });
 
+                // ── Deduct from linked bank account ──
+                let transactionId = null;
+                const smsSettings = keyDoc.data();
+                let deductAccountId = smsSettings.accountId || null;
+
+                // If SMS contains a card number, find the matching account
+                if (parsed.cardLast4) {
+                    const accountsSnap = await db.collection(`users/${userId}/accounts`).get();
+                    for (const accDoc of accountsSnap.docs) {
+                        const acc = accDoc.data();
+                        if (acc.cards && Array.isArray(acc.cards) && acc.cards.includes(parsed.cardLast4)) {
+                            deductAccountId = accDoc.id;
+                            break;
+                        }
+                    }
+                }
+
+                if (deductAccountId) {
+                    const txnRef = await db.collection(`users/${userId}/transactions`).add({
+                        accountId: deductAccountId,
+                        amount: -parsed.amount,
+                        bucket: "deposit",
+                        date: Timestamp.fromDate(entryDate),
+                        notes: parsed.merchant
+                            ? `SMS: ${parsed.merchant}`
+                            : `SMS expense`,
+                        createdAt: Timestamp.now(),
+                    });
+                    transactionId = txnRef.id;
+                }
+
                 res.status(200).json({
                     success: true,
                     parsed,
                     entryId: entryRef.id,
                     expenseId: smsExpenseId,
-                    message: `Added ${parsed.amount} ${parsed.currency || "OMR"} expense${parsed.merchant ? ` for ${parsed.merchant}` : ""}`,
+                    transactionId,
+                    message: `Added ${parsed.amount} ${parsed.currency || "OMR"} expense${parsed.merchant ? ` for ${parsed.merchant}` : ""}${transactionId ? " (deducted from account)" : ""}`,
                 });
 
             } catch (err) {
@@ -153,6 +188,76 @@ export const parseSms = onRequest(
         } catch (err) {
             console.error("Unhandled error in parseSms:", err);
             res.status(500).json({ error: "Internal server error", detail: err.message });
+        }
+    }
+);
+
+// ── Scheduled: Auto-Record Weekly Income ──────────────────────
+// Runs every Saturday at 00:05 Oman time (after the Sat–Fri week ends).
+// For each user with depositAccountId set, creates missing deposit
+// transactions for all completed weeks since startDate.
+export const autoRecordIncome = onSchedule(
+    {
+        schedule: "5 0 * * 6", // Saturday 00:05
+        timeZone: "Asia/Muscat",
+        region: "us-central1",
+    },
+    async () => {
+        const usersSnap = await db.collection("users").listDocuments();
+
+        for (const userRef of usersSnap) {
+            const incomeDoc = await db.doc(`users/${userRef.id}/settings/income`).get();
+            if (!incomeDoc.exists) continue;
+            const income = incomeDoc.data();
+            if (!income.depositAccountId || !income.startDate || !income.weeklyAmount) continue;
+
+            const startDate = new Date(income.startDate);
+            const now = new Date();
+            const msPerWeek = 7 * 24 * 60 * 60 * 1000;
+            const totalWeeks = Math.floor((now.getTime() - startDate.getTime()) / msPerWeek);
+            if (totalWeeks <= 0) continue;
+
+            // Get existing auto-deposits to avoid duplicates
+            const autoSnap = await db
+                .collection(`users/${userRef.id}/transactions`)
+                .where("notes", ">=", "Auto: Weekly income #")
+                .where("notes", "<=", "Auto: Weekly income #\uf8ff")
+                .get();
+
+            const existingWeeks = new Set();
+            autoSnap.docs.forEach((d) => {
+                const match = d.data().notes?.match(/Auto: Weekly income #(\d+)/);
+                if (match) existingWeeks.add(parseInt(match[1]));
+            });
+
+            // Create missing deposits
+            const batch = db.batch();
+            let count = 0;
+            for (let w = 1; w <= totalWeeks; w++) {
+                if (existingWeeks.has(w)) continue;
+                // Deposit date = last day of the week (startDate + w*7 - 1 day)
+                const depositDate = new Date(startDate.getTime() + w * msPerWeek);
+                depositDate.setDate(depositDate.getDate() - 1);
+                depositDate.setHours(23, 0, 0, 0);
+
+                const ref = db.collection(`users/${userRef.id}/transactions`).doc();
+                batch.set(ref, {
+                    accountId: income.depositAccountId,
+                    amount: income.weeklyAmount,
+                    bucket: "deposit",
+                    date: Timestamp.fromDate(depositDate),
+                    notes: `Auto: Weekly income #${w}`,
+                    createdAt: FieldValue.serverTimestamp(),
+                });
+                count++;
+                // Firestore batches limited to 500 writes
+                if (count >= 450) break;
+            }
+
+            if (count > 0) {
+                await batch.commit();
+                console.log(`autoRecordIncome: Created ${count} deposits for user ${userRef.id}`);
+            }
         }
     }
 );

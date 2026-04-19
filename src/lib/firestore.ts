@@ -252,15 +252,27 @@ export function subscribeToIncomeSettings(
 
 // ─── SMS API Key ─────────────────────────────────────
 
-export async function getSmsApiKey(userId: string): Promise<string | null> {
+export async function getSmsSettings(userId: string): Promise<{ key: string | null; accountId: string | null }> {
     const ref = doc(db, 'users', userId, 'settings', 'smsApiKey');
     const snap = await getDoc(ref);
-    return snap.exists() ? snap.data().key : null;
+    if (!snap.exists()) return { key: null, accountId: null };
+    const data = snap.data();
+    return { key: data.key ?? null, accountId: data.accountId ?? null };
+}
+
+export async function getSmsApiKey(userId: string): Promise<string | null> {
+    const { key } = await getSmsSettings(userId);
+    return key;
 }
 
 export function setSmsApiKey(userId: string, key: string) {
     const ref = doc(db, 'users', userId, 'settings', 'smsApiKey');
-    return setDoc(ref, { key, updatedAt: Timestamp.now() });
+    return setDoc(ref, { key, updatedAt: Timestamp.now() }, { merge: true });
+}
+
+export function setSmsAccountId(userId: string, accountId: string) {
+    const ref = doc(db, 'users', userId, 'settings', 'smsApiKey');
+    return setDoc(ref, { accountId, updatedAt: Timestamp.now() }, { merge: true });
 }
 
 // ─── Viewer Access (read-only sharing) ───────────────
