@@ -6,6 +6,8 @@ import {
     updateDoc,
     deleteDoc,
     setDoc,
+    getDoc,
+    getDocs,
     query,
     orderBy,
     where,
@@ -13,7 +15,7 @@ import {
     onSnapshot,
     type Unsubscribe,
 } from 'firebase/firestore';
-import type { Expense, ExpenseEntry, Transaction, Goals, Account, AccountType, Currency, IncomeSettings } from '@/types';
+import type { Expense, ExpenseEntry, Transaction, Goals, Account, AccountType, Currency, IncomeSettings, ViewerAccess, Loan, LoanRepayment } from '@/types';
 
 // ─── Accounts (dynamic saving places) ────────────────
 
@@ -23,6 +25,15 @@ export function addAccount(
 ) {
     const ref = collection(db, 'users', userId, 'accounts');
     return addDoc(ref, { ...account, createdAt: Timestamp.now() });
+}
+
+export function updateAccount(
+    userId: string,
+    accountId: string,
+    data: Partial<Omit<Account, 'id' | 'createdAt'>>
+) {
+    const ref = doc(db, 'users', userId, 'accounts', accountId);
+    return updateDoc(ref, data);
 }
 
 export function deleteAccount(userId: string, accountId: string) {
@@ -40,6 +51,7 @@ export function subscribeToAccounts(
         const accounts = snapshot.docs.map((d) => ({
             id: d.id,
             ...d.data(),
+            isExternal: d.data().isExternal ?? false,
             createdAt: d.data().createdAt?.toDate?.() ?? new Date(),
         })) as Account[];
         callback(accounts);
@@ -105,6 +117,17 @@ export function deleteExpenseEntry(userId: string, entryId: string) {
     return deleteDoc(ref);
 }
 
+export function updateExpenseEntry(
+    userId: string,
+    entryId: string,
+    data: Partial<Omit<ExpenseEntry, 'id' | 'createdAt'>>
+) {
+    const ref = doc(db, 'users', userId, 'expenseEntries', entryId);
+    const payload: Record<string, unknown> = { ...data };
+    if (data.date) payload.date = Timestamp.fromDate(data.date);
+    return updateDoc(ref, payload);
+}
+
 export function subscribeToExpenseEntries(
     userId: string,
     callback: (entries: ExpenseEntry[]) => void
@@ -152,6 +175,28 @@ export function deleteTransaction(userId: string, transactionId: string) {
     return deleteDoc(ref);
 }
 
+export async function deleteTransactionsByLoanId(userId: string, loanId: string) {
+    const ref = collection(db, 'users', userId, 'transactions');
+    const q = query(ref, where('loanId', '==', loanId));
+    const snapshot = await getDocs(q);
+    const deletes = snapshot.docs.map((d) => deleteDoc(d.ref));
+    await Promise.all(deletes);
+}
+
+export async function deleteLoanCascade(userId: string, loanId: string) {
+    // Delete all repayments for this loan
+    const repRef = collection(db, 'users', userId, 'loanRepayments');
+    const repQ = query(repRef, where('loanId', '==', loanId));
+    const repSnap = await getDocs(repQ);
+    const repDeletes = repSnap.docs.map((d) => deleteDoc(d.ref));
+    await Promise.all(repDeletes);
+    // Delete all transactions linked to this loan
+    await deleteTransactionsByLoanId(userId, loanId);
+    // Delete the loan itself
+    const loanRef = doc(db, 'users', userId, 'loans', loanId);
+    await deleteDoc(loanRef);
+}
+
 export function subscribeToTransactions(
     userId: string,
     callback: (transactions: Transaction[]) => void
@@ -163,6 +208,7 @@ export function subscribeToTransactions(
             id: d.id,
             ...d.data(),
             bucket: d.data().bucket ?? 'saving',
+            notes: d.data().notes ?? '',
             date: d.data().date?.toDate?.() ?? d.data().createdAt?.toDate?.() ?? new Date(0),
             createdAt: d.data().createdAt?.toDate?.() ?? new Date(0),
         })) as Transaction[];
@@ -201,5 +247,150 @@ export function subscribeToIncomeSettings(
     const ref = doc(db, 'users', userId, 'settings', 'income');
     return onSnapshot(ref, (snapshot) => {
         callback(snapshot.exists() ? (snapshot.data() as IncomeSettings) : null);
+    });
+}
+
+// ─── SMS API Key ─────────────────────────────────────
+
+export async function getSmsApiKey(userId: string): Promise<string | null> {
+    const ref = doc(db, 'users', userId, 'settings', 'smsApiKey');
+    const snap = await getDoc(ref);
+    return snap.exists() ? snap.data().key : null;
+}
+
+export function setSmsApiKey(userId: string, key: string) {
+    const ref = doc(db, 'users', userId, 'settings', 'smsApiKey');
+    return setDoc(ref, { key, updatedAt: Timestamp.now() });
+}
+
+// ─── Viewer Access (read-only sharing) ───────────────
+
+export async function getViewerAccess(
+    viewerEmail: string
+): Promise<ViewerAccess | null> {
+    const ref = doc(db, 'viewerAccess', viewerEmail);
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return null;
+    const data = snap.data();
+    return {
+        ownerUid: data.ownerUid,
+        ownerEmail: data.ownerEmail,
+        grantedAt: data.grantedAt?.toDate?.() ?? new Date(),
+    };
+}
+
+export function grantViewerAccess(
+    ownerUid: string,
+    ownerEmail: string,
+    viewerEmail: string
+) {
+    const ref = doc(db, 'viewerAccess', viewerEmail);
+    return setDoc(ref, {
+        ownerUid,
+        ownerEmail,
+        grantedAt: Timestamp.now(),
+    });
+}
+
+export function revokeViewerAccess(viewerEmail: string) {
+    const ref = doc(db, 'viewerAccess', viewerEmail);
+    return deleteDoc(ref);
+}
+
+export function subscribeToViewers(
+    ownerUid: string,
+    callback: (viewers: { email: string; grantedAt: Date }[]) => void
+): Unsubscribe {
+    const ref = collection(db, 'viewerAccess');
+    const q = query(ref, where('ownerUid', '==', ownerUid));
+    return onSnapshot(q, (snapshot) => {
+        const viewers = snapshot.docs.map((d) => ({
+            email: d.id,
+            grantedAt: d.data().grantedAt?.toDate?.() ?? new Date(),
+        }));
+        callback(viewers);
+    });
+}
+
+// ─── Loans ───────────────────────────────────────────
+
+export function addLoan(
+    userId: string,
+    loan: Omit<Loan, 'id' | 'createdAt'>
+) {
+    const ref = collection(db, 'users', userId, 'loans');
+    return addDoc(ref, {
+        ...loan,
+        date: Timestamp.fromDate(loan.date),
+        createdAt: Timestamp.now(),
+    });
+}
+
+export function updateLoan(
+    userId: string,
+    loanId: string,
+    data: Partial<Omit<Loan, 'id' | 'createdAt'>>
+) {
+    const ref = doc(db, 'users', userId, 'loans', loanId);
+    const payload: Record<string, unknown> = { ...data };
+    if (data.date) payload.date = Timestamp.fromDate(data.date);
+    return updateDoc(ref, payload);
+}
+
+export function deleteLoan(userId: string, loanId: string) {
+    const ref = doc(db, 'users', userId, 'loans', loanId);
+    return deleteDoc(ref);
+}
+
+export function subscribeToLoans(
+    userId: string,
+    callback: (loans: Loan[]) => void
+): Unsubscribe {
+    const ref = collection(db, 'users', userId, 'loans');
+    const q = query(ref, orderBy('createdAt', 'desc'));
+    return onSnapshot(q, (snapshot) => {
+        const loans = snapshot.docs.map((d) => ({
+            id: d.id,
+            ...d.data(),
+            date: d.data().date?.toDate?.() ?? new Date(),
+            createdAt: d.data().createdAt?.toDate?.() ?? new Date(),
+        })) as Loan[];
+        callback(loans);
+    });
+}
+
+// ─── Loan Repayments ─────────────────────────────────
+
+export function addLoanRepayment(
+    userId: string,
+    repayment: Omit<LoanRepayment, 'id' | 'createdAt'>
+) {
+    const ref = collection(db, 'users', userId, 'loanRepayments');
+    return addDoc(ref, {
+        ...repayment,
+        date: Timestamp.fromDate(repayment.date),
+        createdAt: Timestamp.now(),
+    });
+}
+
+export function deleteLoanRepayment(userId: string, repaymentId: string) {
+    const ref = doc(db, 'users', userId, 'loanRepayments', repaymentId);
+    return deleteDoc(ref);
+}
+
+export function subscribeToLoanRepayments(
+    userId: string,
+    callback: (repayments: LoanRepayment[]) => void
+): Unsubscribe {
+    const ref = collection(db, 'users', userId, 'loanRepayments');
+    const q = query(ref, orderBy('date', 'desc'));
+    return onSnapshot(q, (snapshot) => {
+        const repayments = snapshot.docs.map((d) => ({
+            id: d.id,
+            ...d.data(),
+            date: d.data().date?.toDate?.() ?? new Date(),
+            createdAt: d.data().createdAt?.toDate?.() ?? new Date(),
+        })) as LoanRepayment[];
+        callback(repayments);
     });
 }

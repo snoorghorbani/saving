@@ -65,12 +65,12 @@ export function toWeekly(amount: number, frequency: Frequency): number {
     }
 }
 
-/** Returns the start (Sunday 00:00) and end (Saturday 23:59) of a week.
+/** Returns the start (Saturday 00:00) and end (Friday 23:59) of a week.
  *  offset 0 = this week, 1 = next week, -1 = last week, etc. */
 export function getWeekRange(offset = 0): { start: Date; end: Date } {
     const now = new Date();
     const start = new Date(now);
-    start.setDate(start.getDate() - start.getDay() + offset * 7);
+    start.setDate(start.getDate() - ((start.getDay() + 1) % 7) + offset * 7);
     start.setHours(0, 0, 0, 0);
     const end = new Date(start);
     end.setDate(end.getDate() + 6);
@@ -97,7 +97,7 @@ export function isDueInWeek(expense: Expense, weekStart: Date, weekEnd: Date): b
 
 /**
  * Calculate the effective budget for a weekly-budget expense this week,
- * accounting for last week's surplus/deficit carryover.
+ * accounting for chained carryover from all past weeks since the expense was created.
  * Positive carryover = underspent last week (bonus), negative = overspent (penalty).
  */
 export function getEffectiveBudget(
@@ -105,22 +105,31 @@ export function getEffectiveBudget(
     entries: ExpenseEntry[],
 ): { baseBudget: number; carryover: number; effectiveBudget: number } {
     const baseBudget = expense.weeklyBudget ?? 0;
-    const lastWeek = getWeekRange(-1);
+    const thisWeek = getWeekRange(0);
 
-    // If the expense was created after last week ended, this is its first week — no carryover
-    if (expense.createdAt > lastWeek.end) {
+    // If the expense was created after this week started, this is its first week — no carryover
+    if (expense.createdAt > thisWeek.start) {
         return { baseBudget, carryover: 0, effectiveBudget: baseBudget };
     }
 
-    const lastWeekSpent = entries
-        .filter(
-            (e) =>
-                e.expenseId === expense.id &&
-                e.date >= lastWeek.start &&
-                e.date <= lastWeek.end
-        )
-        .reduce((sum, e) => sum + e.amount, 0);
-    const carryover = baseBudget - lastWeekSpent; // positive = saved, negative = overspent
+    // Walk backwards week by week, accumulating carryover
+    const expenseEntries = entries.filter(
+        (e) => e.expenseId === expense.id && e.type !== 'set-aside'
+    );
+
+    let carryover = 0;
+    for (let offset = -1; ; offset--) {
+        const week = getWeekRange(offset);
+        // Stop if we've gone before the expense was created
+        if (week.end < expense.createdAt) break;
+
+        const weekEffective = baseBudget + carryover;
+        const weekSpent = expenseEntries
+            .filter((e) => e.date >= week.start && e.date <= week.end)
+            .reduce((sum, e) => sum + e.amount, 0);
+        carryover = weekEffective - weekSpent;
+    }
+
     return {
         baseBudget,
         carryover,

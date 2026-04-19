@@ -62,6 +62,7 @@ export interface ExpenseEntry {
     date: Date;
     notes: string;
     type?: 'purchase' | 'set-aside';
+    accountId?: string;        // which account's deposit bucket this payment came from
     createdAt: Date;
 }
 
@@ -72,6 +73,7 @@ export interface Account {
     name: string;
     type: AccountType;
     currency: Currency;
+    isExternal?: boolean;      // true → not funded by tracked income (excluded from untracked calc)
     createdAt: Date;
 }
 
@@ -84,6 +86,7 @@ export interface Transaction {
     bucket: Bucket;
     date: Date;
     notes: string;
+    loanId?: string;
     createdAt: Date;
 }
 
@@ -97,4 +100,30 @@ export interface IncomeSettings {
     currency: Currency;
     startDate: string; // ISO date string — first week of income
     weeksReceived: number; // total weeks of income received so far
+}
+
+export interface ViewerAccess {
+    ownerUid: string;
+    ownerEmail: string;
+    grantedAt: Date;
+}
+
+export interface Loan {
+    id: string;
+    accountId: string;         // savings account the loan was taken from (saving bucket)
+    depositAccountId: string;  // savings account the loan goes to (deposit bucket)
+    principal: number;         // original loan amount (in account currency)
+    balance: number;           // outstanding balance remaining
+    date: Date;                // date loan was issued
+    notes: string;
+    createdAt: Date;
+}
+
+export interface LoanRepayment {
+    id: string;
+    loanId: string;
+    amount: number;            // repayment amount (in account currency)
+    date: Date;
+    notes: string;
+    createdAt: Date;
 }

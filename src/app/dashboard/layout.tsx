@@ -9,7 +9,7 @@ export default function DashboardLayout({
 }: {
     children: React.ReactNode;
 }) {
-    const { user, loading } = useAuth();
+    const { user, loading, isViewer, ownerEmail } = useAuth();
 
     useEffect(() => {
         if (!loading && !user) {
@@ -28,6 +28,13 @@ export default function DashboardLayout({
     return (
         <div className="min-h-screen bg-slate-50">
             <Navbar />
+            {isViewer && (
+                <div className="bg-amber-50 border-b border-amber-200 px-4 py-2 text-center">
+                    <p className="text-sm text-amber-700">
+                        👁 Viewing <span className="font-semibold">{ownerEmail}</span>&apos;s account (read-only)
+                    </p>
+                </div>
+            )}
             <main className="mx-auto max-w-7xl px-4 py-8 sm:px-6 lg:px-8">
                 {children}
             </main>

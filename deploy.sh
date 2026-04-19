@@ -50,6 +50,9 @@ log "Using Firebase project: $PROJECT_ID"
 log "Installing dependencies..."
 npm ci --prefer-offline 2>/dev/null || npm install
 
+log "Installing Cloud Functions dependencies..."
+(cd functions && npm install)
+
 # ── Deploy Firestore rules ───────────────────────────────────
 
 log "Deploying Firestore security rules..."
@@ -62,6 +65,9 @@ npm run build
 
 log "Deploying to Firebase Hosting..."
 firebase deploy --only hosting
+
+log "Deploying Cloud Functions..."
+firebase deploy --only functions
 
 echo ""
 log "Deployment complete!"
