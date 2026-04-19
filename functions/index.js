@@ -99,45 +99,30 @@ export const parseSms = onRequest(
             const entryDate = parsed.date || new Date();
 
             try {
-                // ── Find or create a matching expense ──
+                // ── Find or create the single "SMS Expenses" expense ──
                 const expensesRef = db.collection(`users/${userId}/expenses`);
                 let smsExpenseId;
 
-                // Try to match merchant to existing expense name (case-insensitive)
-                if (parsed.merchant) {
-                    const allExpenses = await expensesRef.get();
-                    const match = allExpenses.docs.find((d) => {
-                        const name = (d.data().name || "").toLowerCase();
-                        const merchant = parsed.merchant.toLowerCase();
-                        return name === merchant || merchant.includes(name) || name.includes(merchant);
+                const existing = await expensesRef.where("name", "==", "SMS Expenses").limit(1).get();
+                if (!existing.empty) {
+                    smsExpenseId = existing.docs[0].id;
+                } else {
+                    const newExp = await expensesRef.add({
+                        kind: "one-time",
+                        name: "SMS Expenses",
+                        amount: 0,
+                        frequency: "one-time",
+                        category: "Other",
+                        isUnexpected: false,
+                        weeklyBudget: null,
+                        dueDay: null,
+                        dueDate: null,
+                        estimatedTotal: null,
+                        deadline: null,
+                        notes: "Auto-created for SMS-parsed expenses",
+                        createdAt: Timestamp.now(),
                     });
-                    if (match) smsExpenseId = match.id;
-                }
-
-                // Fallback: create a new expense per merchant, or generic "SMS Expenses"
-                if (!smsExpenseId) {
-                    const expenseName = parsed.merchant || "SMS Expenses";
-                    const existing = await expensesRef.where("name", "==", expenseName).limit(1).get();
-                    if (!existing.empty) {
-                        smsExpenseId = existing.docs[0].id;
-                    } else {
-                        const newExp = await expensesRef.add({
-                            kind: "one-time",
-                            name: expenseName,
-                            amount: 0,
-                            frequency: "one-time",
-                            category: "Other",
-                            isUnexpected: false,
-                            weeklyBudget: null,
-                            dueDay: null,
-                            dueDate: null,
-                            estimatedTotal: null,
-                            deadline: null,
-                            notes: parsed.merchant ? "Auto-created from SMS" : "Auto-created for SMS-parsed expenses",
-                            createdAt: Timestamp.now(),
-                        });
-                        smsExpenseId = newExp.id;
-                    }
+                    smsExpenseId = newExp.id;
                 }
 
                 // ── Write expense entry ──
