@@ -682,7 +682,7 @@ export default function ExpensesPage() {
                                                             onClick={() => setEntryMenuId(isMenuOpen ? null : entry.id)}
                                                             className="p-1 text-slate-400 hover:text-slate-600 rounded-full hover:bg-slate-100"
                                                         >
-                                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="12" cy="19" r="2"/></svg>
+                                                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><circle cx="12" cy="5" r="2" /><circle cx="12" cy="12" r="2" /><circle cx="12" cy="19" r="2" /></svg>
                                                         </button>
                                                         {isMenuOpen && (
                                                             <div className="absolute right-0 top-8 z-10 bg-white border border-slate-200 rounded-lg shadow-lg py-1 w-28">
