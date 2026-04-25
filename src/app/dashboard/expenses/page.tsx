@@ -122,26 +122,46 @@ export default function ExpensesPage() {
         );
     };
 
-    const handleMarkAsPaid = async (expense: Expense) => {
-        if (!user || isViewer || !isCurrentWeek) return;
+    const recordExpensePayment = async (expense: Expense, paymentDate: Date, entryNote?: string) => {
+        if (!user || isViewer) return;
         const acc = accounts.find((a) => a.id === payFromAccount);
         if (!acc) { alert('Please select a Pay From account first.'); return; }
         const amtInAccCurrency = acc.currency === 'OMR' ? expense.amount : await convert(expense.amount, 'OMR', acc.currency);
-        if (!confirm(`Mark "${expense.name}" as paid (${formatOMR(expense.amount)}) from ${acc.name}?`)) return;
         const entryRef = await addExpenseEntry(user.uid, {
             expenseId: expense.id,
             amount: expense.amount,
-            date: new Date(),
-            notes: `${expense.name} payment`,
+            date: paymentDate,
+            notes: entryNote ?? `${expense.name} payment`,
             accountId: payFromAccount,
         });
         await addTransaction(user.uid, {
             accountId: payFromAccount,
             amount: -amtInAccCurrency,
             bucket: 'deposit',
-            date: new Date(),
+            date: paymentDate,
             notes: `Expense: ${expense.name} [entry:${entryRef.id}]`,
         });
+    };
+
+    const handleMarkAsPaid = async (expense: Expense) => {
+        if (!isCurrentWeek || !user || isViewer) return;
+        const acc = accounts.find((a) => a.id === payFromAccount);
+        if (!acc) { alert('Please select a Pay From account first.'); return; }
+        if (!confirm(`Mark "${expense.name}" as paid (${formatOMR(expense.amount)}) from ${acc.name}?`)) return;
+        await recordExpensePayment(expense, new Date(), `${expense.name} payment`);
+    };
+
+    const handlePayNow = async (expense: Expense) => {
+        if (!user || isViewer) return;
+        const acc = accounts.find((a) => a.id === payFromAccount);
+        if (!acc) { alert('Please select a Pay From account first.'); return; }
+        const inferredKind = expense.kind
+            ?? (expense.frequency === 'one-time' ? 'one-time' : expense.weeklyBudget != null && expense.amount <= 0 ? 'budget' : 'fixed-payment');
+        const isFixed = inferredKind === 'fixed-payment';
+        const isDueNow = isFixed ? isDueInWeek(expense, getWeekRange(0).start, getWeekRange(0).end) : false;
+        const note = isFixed && !isDueNow ? `${expense.name} early payment` : `${expense.name} payment`;
+        if (!confirm(`Pay "${expense.name}" now (${formatOMR(expense.amount)}) from ${acc.name}?`)) return;
+        await recordExpensePayment(expense, new Date(), note);
     };
 
     const handleUndoPaid = async (expense: Expense, weekStart: Date, weekEnd: Date) => {
@@ -874,6 +894,14 @@ export default function ExpensesPage() {
                                         <div className="text-right">
                                             <p className="text-sm font-bold text-slate-800">{formatOMR(weeklyImpact)}/wk</p>
                                         </div>
+                                        {!isViewer && (
+                                            <button
+                                                onClick={() => handlePayNow(expense)}
+                                                className="text-xs text-emerald-600 hover:text-emerald-700"
+                                            >
+                                                Pay Now
+                                            </button>
+                                        )}
                                         {!isViewer && <button onClick={() => handleEdit(expense)} className="text-xs text-slate-400 hover:text-emerald-600">Edit</button>}
                                         {!isViewer && <button onClick={() => handleDelete(expense.id)} className="text-xs text-slate-400 hover:text-red-500">Delete</button>}
                                     </div>
@@ -1062,7 +1090,7 @@ export default function ExpensesPage() {
                                             <span className="text-xs text-emerald-600 bg-emerald-100 px-2 py-1 rounded-full">✓ Paid</span>
                                         ) : !isViewer ? (
                                             <button
-                                                onClick={() => handleMarkAsPaid(expense)}
+                                                onClick={() => handlePayNow(expense)}
                                                 className="text-xs bg-emerald-600 text-white px-3 py-1.5 rounded-full hover:bg-emerald-700 transition-colors"
                                             >
                                                 Pay
@@ -1296,4 +1324,3 @@ export default function ExpensesPage() {
         </div>
     );
 }
-

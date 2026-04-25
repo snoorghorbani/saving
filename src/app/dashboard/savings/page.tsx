@@ -17,10 +17,17 @@ import {
     deleteLoanCascade,
     subscribeToLoanRepayments,
     addLoanRepayment,
+    subscribeToGoals,
 } from '@/lib/firestore';
 import type { Transaction, Account, AccountType, Currency, Bucket, Loan, LoanRepayment } from '@/types';
 import { CURRENCIES } from '@/types';
 import { formatCurrency, convert } from '@/lib/currency';
+import {
+    isSameSavingsWeek,
+    formatSavingsWeekLabel,
+    planSavingDebtAllocations,
+    savingsWeekKey,
+} from '@/lib/savings-debt';
 
 export default function SavingsPage() {
     const { user, effectiveUserId, isViewer } = useAuth();
@@ -32,6 +39,7 @@ export default function SavingsPage() {
     const [filterAccount, setFilterAccount] = useState<string | 'all'>('all');
     const [displayCurrency, setDisplayCurrency] = useState<Currency>('USD');
     const [convertedTotal, setConvertedTotal] = useState<number | null>(null);
+    const [weeklyTargetOmr, setWeeklyTargetOmr] = useState(0);
 
     // Loan state
     const [loans, setLoans] = useState<Loan[]>([]);
@@ -77,7 +85,10 @@ export default function SavingsPage() {
         const unsub2 = subscribeToAccounts(effectiveUserId, setAccounts);
         const unsub3 = subscribeToLoans(effectiveUserId, setLoans);
         const unsub4 = subscribeToLoanRepayments(effectiveUserId, setLoanRepayments);
-        return () => { unsub1(); unsub2(); unsub3(); unsub4(); };
+        const unsub5 = subscribeToGoals(effectiveUserId, (goals) => {
+            setWeeklyTargetOmr(goals?.weeklyTarget ?? 0);
+        });
+        return () => { unsub1(); unsub2(); unsub3(); unsub4(); unsub5(); };
     }, [effectiveUserId]);
 
     // Set default accountId when accounts load
@@ -122,23 +133,101 @@ export default function SavingsPage() {
         if (!user || isViewer || !amount || !accountId) return;
         const [y, m, d] = date.split('-').map(Number);
         const localDate = new Date(y, m - 1, d);
+        const parsedAmount = parseFloat(amount);
+        if (isNaN(parsedAmount) || parsedAmount === 0) return;
         if (editingTxnId) {
             await updateTransaction(user.uid, editingTxnId, {
                 accountId,
-                amount: parseFloat(amount),
+                amount: parsedAmount,
                 bucket,
                 date: localDate,
                 notes,
             });
             setEditingTxnId(null);
         } else {
-            await addTransaction(user.uid, {
-                accountId,
-                amount: parseFloat(amount),
-                bucket,
-                date: localDate,
-                notes,
-            });
+            const account = accounts.find((a) => a.id === accountId);
+            const shouldAutoAllocateDebt =
+                !!account &&
+                bucket === 'saving' &&
+                parsedAmount > 0 &&
+                weeklyTargetOmr > 0 &&
+                isSameSavingsWeek(localDate, new Date());
+
+            if (shouldAutoAllocateDebt) {
+                const accountMap = new Map(accounts.map((a) => [a.id, a]));
+                const savedByWeekKey: Record<string, number> = {};
+
+                for (const txn of transactions) {
+                    if (txn.bucket !== 'saving') continue;
+                    const txnAccount = accountMap.get(txn.accountId);
+                    const txnCurrency = txnAccount?.currency ?? 'OMR';
+                    const txnAmountOmr = await convert(txn.amount, txnCurrency, 'OMR');
+                    const key = savingsWeekKey(txn.date);
+                    savedByWeekKey[key] = (savedByWeekKey[key] ?? 0) + txnAmountOmr;
+                }
+
+                const amountOmr = await convert(parsedAmount, account.currency, 'OMR');
+                const allocations = planSavingDebtAllocations({
+                    selectedDate: localDate,
+                    totalAmountOmr: amountOmr,
+                    weeklyTargetOmr,
+                    savedByWeekKey,
+                });
+
+                if (allocations.length > 0) {
+                    let consumed = 0;
+                    const baseNotes = notes.trim();
+                    for (let i = 0; i < allocations.length; i++) {
+                        const allocation = allocations[i];
+                        const isLast = i === allocations.length - 1;
+                        const splitAmount = isLast
+                            ? parsedAmount - consumed
+                            : await convert(allocation.amountOmr, 'OMR', account.currency);
+                        consumed += splitAmount;
+
+                        const allocationDate = allocation.isCurrentWeek
+                            ? localDate
+                            : new Date(
+                                allocation.weekEnd.getFullYear(),
+                                allocation.weekEnd.getMonth(),
+                                allocation.weekEnd.getDate(),
+                                12,
+                                0,
+                                0,
+                                0,
+                            );
+                        const allocationNotes = allocation.isCurrentWeek
+                            ? baseNotes
+                            : [baseNotes, `Debt fill: ${formatSavingsWeekLabel(allocation.weekStart, allocation.weekEnd)}`]
+                                .filter(Boolean)
+                                .join(' · ');
+
+                        await addTransaction(user.uid, {
+                            accountId,
+                            amount: splitAmount,
+                            bucket,
+                            date: allocationDate,
+                            notes: allocationNotes,
+                        });
+                    }
+                } else {
+                    await addTransaction(user.uid, {
+                        accountId,
+                        amount: parsedAmount,
+                        bucket,
+                        date: localDate,
+                        notes,
+                    });
+                }
+            } else {
+                await addTransaction(user.uid, {
+                    accountId,
+                    amount: parsedAmount,
+                    bucket,
+                    date: localDate,
+                    notes,
+                });
+            }
         }
         setAmount('');
         setNotes('');
