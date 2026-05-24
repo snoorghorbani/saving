@@ -141,6 +141,6 @@ A separate `functions/` directory contains Firebase Cloud Functions (2nd Gen, No
 
 | Function | Trigger | Purpose |
 |----------|---------|---------|
-| `parseSms` | HTTP POST | Receives bank SMS text from iOS Shortcuts, parses amount/merchant/date, and writes expense entries to Firestore. Authenticated via per-user API key stored in `users/{userId}/settings/smsApiKey`. |
+| `parseSms` | HTTP POST | Receives bank SMS text from iOS Shortcuts, parses amount/merchant/date/currency, writes OMR expense entries, and creates a linked deposit deduction converted to the target account currency. Authenticated via per-user API key stored in `users/{userId}/settings/smsApiKey`. |
 
 Functions have their own `package.json` and `node_modules`, independent of the main app.

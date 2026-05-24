@@ -8,13 +8,99 @@ initializeApp();
 const db = getFirestore();
 const ai = new GoogleGenAI({ vertexai: true, project: "soushians-4d02a", location: "us-central1" });
 
+const SUPPORTED_CURRENCIES = new Set(["OMR", "USD", "EUR", "TRY", "GBP", "AED", "SAR", "INR"]);
+const CURRENCY_ALIASES = {
+    RO: "OMR",
+    RIAL: "OMR",
+    RIALS: "OMR",
+    OMR: "OMR",
+    USD: "USD",
+    "US$": "USD",
+    EUR: "EUR",
+    EURO: "EUR",
+    TRY: "TRY",
+    TL: "TRY",
+    GBP: "GBP",
+    AED: "AED",
+    SAR: "SAR",
+    INR: "INR",
+};
+
+let rateCache = null;
+const RATE_CACHE_TTL_MS = 60 * 60 * 1000;
+
+function roundCurrency(amount, currency) {
+    const decimals = currency === "OMR" ? 3 : 2;
+    return Number(amount.toFixed(decimals));
+}
+
+function normalizeCurrency(raw, smsText) {
+    const candidates = [];
+    if (typeof raw === "string" && raw.trim()) candidates.push(raw.trim());
+    if (typeof smsText === "string" && smsText.trim()) {
+        candidates.push(smsText);
+    }
+
+    for (const candidate of candidates) {
+        const upper = candidate.toUpperCase();
+        if (upper.includes("RO")) return "OMR";
+
+        for (const token of upper.match(/[A-Z$]{2,5}/g) || []) {
+            const mapped = CURRENCY_ALIASES[token] || null;
+            if (mapped && SUPPORTED_CURRENCIES.has(mapped)) return mapped;
+            if (SUPPORTED_CURRENCIES.has(token)) return token;
+        }
+
+        if (/\$/.test(candidate) && !/CAD|AUD|NZD|SGD/i.test(candidate)) {
+            return "USD";
+        }
+    }
+
+    return "OMR";
+}
+
+async function getRates() {
+    if (rateCache && Date.now() - rateCache.timestamp < RATE_CACHE_TTL_MS) {
+        return rateCache.rates;
+    }
+
+    try {
+        const response = await fetch("https://open.er-api.com/v6/latest/USD");
+        if (!response.ok) throw new Error(`Rate API failed with ${response.status}`);
+        const data = await response.json();
+        const rates = data.rates ?? {};
+        rateCache = { rates, timestamp: Date.now() };
+        return rates;
+    } catch {
+        if (rateCache) return rateCache.rates;
+        return {
+            USD: 1,
+            OMR: 0.385,
+            EUR: 0.92,
+            TRY: 32.5,
+            GBP: 0.79,
+            AED: 3.67,
+            SAR: 3.75,
+            INR: 83.5,
+        };
+    }
+}
+
+async function convertAmount(amount, from, to) {
+    if (from === to) return amount;
+    const rates = await getRates();
+    const fromRate = rates[from] ?? 1;
+    const toRate = rates[to] ?? 1;
+    return (amount / fromRate) * toRate;
+}
+
 // ── SMS Parser (Gemini AI) ────────────────────────────────────
 async function parseSMS(text) {
     const today = new Date().toISOString().slice(0, 10);
     const prompt = `Extract transaction details from this bank SMS message.
 Return a JSON object with exactly these fields:
 - "amount": number (the transaction amount, e.g. 1.050)
-- "currency": string (e.g. "OMR", "USD", "AED". Use "OMR" if "RO" is mentioned)
+- "currency": string (3-letter code: OMR, USD, EUR, TRY, GBP, AED, SAR, INR. Use "OMR" if "RO" is mentioned)
 - "merchant": string or null (the merchant/store name only, without "POS -" prefix)
 - "date": string in "YYYY-MM-DD" format, or null if not found. Today is ${today}.
 - "cardLast4": string or null (the last 4 digits of the card/account used, e.g. "7592")
@@ -35,9 +121,11 @@ SMS: "${text}"`;
         if (!isNaN(d.getTime())) parsedDate = d;
     }
 
+    const normalizedCurrency = normalizeCurrency(parsed.currency, text);
+
     return {
         amount: typeof parsed.amount === "number" ? parsed.amount : null,
-        currency: parsed.currency || "OMR",
+        currency: normalizedCurrency,
         merchant: parsed.merchant || null,
         cardLast4: parsed.cardLast4 || null,
         date: parsedDate,
@@ -100,6 +188,10 @@ export const parseSms = onRequest(
             }
 
             const entryDate = parsed.date || new Date();
+            const smsCurrency = normalizeCurrency(parsed.currency, sms);
+            const amountOmrRaw = await convertAmount(parsed.amount, smsCurrency, "OMR");
+            const amountOmr = roundCurrency(amountOmrRaw, "OMR");
+            const originalAmountLabel = `${roundCurrency(parsed.amount, smsCurrency)} ${smsCurrency}`;
 
             try {
                 // ── Find or create the single "SMS Expenses" expense ──
@@ -131,11 +223,11 @@ export const parseSms = onRequest(
                 // ── Write expense entry ──
                 const entryRef = await db.collection(`users/${userId}/expenseEntries`).add({
                     expenseId: smsExpenseId,
-                    amount: parsed.amount,
+                    amount: amountOmr,
                     date: Timestamp.fromDate(entryDate),
                     notes: parsed.merchant
-                        ? `${parsed.merchant} (SMS)`
-                        : `SMS: ${sms.substring(0, 80)}`,
+                        ? `${parsed.merchant} (SMS ${originalAmountLabel})`
+                        : `SMS ${originalAmountLabel}: ${sms.substring(0, 80)}`,
                     type: "purchase",
                     createdAt: Timestamp.now(),
                 });
@@ -144,12 +236,14 @@ export const parseSms = onRequest(
                 let transactionId = null;
                 const smsSettings = keyDoc.data();
                 let deductAccountId = smsSettings.accountId || null;
+                const accountById = new Map();
 
                 // If SMS contains a card number, find the matching account
                 if (parsed.cardLast4) {
                     const accountsSnap = await db.collection(`users/${userId}/accounts`).get();
                     for (const accDoc of accountsSnap.docs) {
                         const acc = accDoc.data();
+                        accountById.set(accDoc.id, acc);
                         if (acc.cards && Array.isArray(acc.cards) && acc.cards.includes(parsed.cardLast4)) {
                             deductAccountId = accDoc.id;
                             break;
@@ -158,14 +252,23 @@ export const parseSms = onRequest(
                 }
 
                 if (deductAccountId) {
+                    let account = accountById.get(deductAccountId);
+                    if (!account) {
+                        const accDoc = await db.doc(`users/${userId}/accounts/${deductAccountId}`).get();
+                        account = accDoc.exists ? accDoc.data() : null;
+                    }
+                    const accountCurrency = normalizeCurrency(account?.currency, null);
+                    const amountInAccountRaw = await convertAmount(parsed.amount, smsCurrency, accountCurrency);
+                    const amountInAccount = roundCurrency(amountInAccountRaw, accountCurrency);
+
                     const txnRef = await db.collection(`users/${userId}/transactions`).add({
                         accountId: deductAccountId,
-                        amount: -parsed.amount,
+                        amount: -amountInAccount,
                         bucket: "deposit",
                         date: Timestamp.fromDate(entryDate),
                         notes: parsed.merchant
-                            ? `SMS: ${parsed.merchant}`
-                            : `SMS expense`,
+                            ? `SMS: ${parsed.merchant} (${originalAmountLabel})`
+                            : `SMS expense (${originalAmountLabel})`,
                         createdAt: Timestamp.now(),
                     });
                     transactionId = txnRef.id;
@@ -173,11 +276,17 @@ export const parseSms = onRequest(
 
                 res.status(200).json({
                     success: true,
-                    parsed,
+                    parsed: {
+                        ...parsed,
+                        currency: smsCurrency,
+                    },
+                    converted: {
+                        entryAmountOmr: amountOmr,
+                    },
                     entryId: entryRef.id,
                     expenseId: smsExpenseId,
                     transactionId,
-                    message: `Added ${parsed.amount} ${parsed.currency || "OMR"} expense${parsed.merchant ? ` for ${parsed.merchant}` : ""}${transactionId ? " (deducted from account)" : ""}`,
+                    message: `Added SMS expense ${originalAmountLabel} as ${amountOmr} OMR${parsed.merchant ? ` for ${parsed.merchant}` : ""}${transactionId ? " (deducted from account currency)" : ""}`,
                 });
 
             } catch (err) {

@@ -13,6 +13,7 @@ import {
     updateExpenseEntry,
     subscribeToAccounts,
     addTransaction,
+    updateTransaction,
     subscribeToTransactions,
     deleteTransaction,
 } from '@/lib/firestore';
@@ -98,6 +99,11 @@ export default function ExpensesPage() {
 
     const spentSelectedWeek = (expenseId: string) => spentInWeek(expenseId, selectedWeek.start, selectedWeek.end);
 
+    const depositBalanceOf = (accountId: string) =>
+        allTransactions
+            .filter((t) => t.accountId === accountId && t.bucket === 'deposit')
+            .reduce((sum, t) => sum + t.amount, 0);
+
     // ── Paid check for fixed payments ─────
     const isPaidInPeriod = (expense: Expense, weekStart: Date, weekEnd: Date): boolean => {
         if (expense.frequency === 'weekly') {
@@ -127,6 +133,11 @@ export default function ExpensesPage() {
         const acc = accounts.find((a) => a.id === payFromAccount);
         if (!acc) { alert('Please select a Pay From account first.'); return; }
         const amtInAccCurrency = acc.currency === 'OMR' ? expense.amount : await convert(expense.amount, 'OMR', acc.currency);
+        const available = depositBalanceOf(acc.id);
+        if (amtInAccCurrency > available) {
+            alert(`Insufficient deposit in ${acc.name}. Available: ${formatOMR(await convert(available, acc.currency, 'OMR'))}`);
+            return;
+        }
         const entryRef = await addExpenseEntry(user.uid, {
             expenseId: expense.id,
             amount: expense.amount,
@@ -213,11 +224,41 @@ export default function ExpensesPage() {
         if (!user || isViewer || !editingEntryId) return;
         const amt = parseFloat(editEntryAmount);
         if (isNaN(amt) || amt <= 0) return;
+        const linkedTxn = allTransactions.find((t) => (t.notes || '').includes(`[entry:${editingEntryId}]`));
+        if (linkedTxn) {
+            const linkedAcc = accounts.find((a) => a.id === linkedTxn.accountId);
+            if (linkedAcc) {
+                const nextWithdrawal = linkedAcc.currency === 'OMR' ? amt : await convert(amt, 'OMR', linkedAcc.currency);
+                const currentWithdrawal = Math.abs(linkedTxn.amount);
+                const additionalRequired = nextWithdrawal - currentWithdrawal;
+                if (additionalRequired > 0) {
+                    const available = depositBalanceOf(linkedAcc.id);
+                    if (additionalRequired > available) {
+                        alert(`Insufficient deposit in ${linkedAcc.name} for this edit. Available: ${formatOMR(await convert(available, linkedAcc.currency, 'OMR'))}`);
+                        return;
+                    }
+                }
+            }
+        }
+
         await updateExpenseEntry(user.uid, editingEntryId, {
             amount: amt,
             notes: editEntryNotes,
             expenseId: editEntryExpenseId,
         });
+
+        if (linkedTxn) {
+            const linkedAcc = accounts.find((a) => a.id === linkedTxn.accountId);
+            const expenseName = expenses.find((exp) => exp.id === editEntryExpenseId)?.name ?? 'Expense';
+            if (linkedAcc) {
+                const nextWithdrawal = linkedAcc.currency === 'OMR' ? amt : await convert(amt, 'OMR', linkedAcc.currency);
+                await updateTransaction(user.uid, linkedTxn.id, {
+                    amount: -nextWithdrawal,
+                    notes: `Expense: ${expenseName} [entry:${editingEntryId}]`,
+                });
+            }
+        }
+
         setEditingEntryId(null);
     };
 
@@ -299,6 +340,14 @@ export default function ExpensesPage() {
     const oneTimeExpenses = expenses.filter((e) => !e.isUnexpected && getKind(e) === 'one-time');
     const futureExpenses = expenses.filter((e) => !e.isUnexpected && getKind(e) === 'future');
     const unexpectedExpenses = expenses.filter((e) => e.isUnexpected);
+    const visibleOneTimeExpenses = oneTimeExpenses.filter((expense) => !entries.some((entry) => entry.expenseId === expense.id && entry.type !== 'set-aside'));
+    const visibleFutureExpenses = futureExpenses.filter((expense) => {
+        const total = expense.estimatedTotal ?? 0;
+        const totalPaid = entries
+            .filter((entry) => entry.expenseId === expense.id && entry.type !== 'set-aside')
+            .reduce((sum, entry) => sum + entry.amount, 0);
+        return totalPaid < total - 0.000001;
+    });
 
     // Fixed payments due this/next week
     const thisWeekFixed = fixedPayments.filter((e) => isDueInWeek(e, selectedWeek.start, selectedWeek.end));
@@ -973,7 +1022,16 @@ export default function ExpensesPage() {
                                                 const [ey, em, ed] = entryDate.split('-').map(Number);
                                                 const entryDateObj = new Date(ey, em - 1, ed);
                                                 const amt = parseFloat(entryAmount);
+                                                if (isNaN(amt) || amt <= 0) return;
                                                 const acc = accounts.find((a) => a.id === payFromAccount);
+                                                if (acc) {
+                                                    const converted = acc.currency === 'OMR' ? amt : await convert(amt, 'OMR', acc.currency);
+                                                    const available = depositBalanceOf(acc.id);
+                                                    if (converted > available) {
+                                                        alert(`Insufficient deposit in ${acc.name}. Available: ${formatOMR(await convert(available, acc.currency, 'OMR'))}`);
+                                                        return;
+                                                    }
+                                                }
                                                 const entryRef = await addExpenseEntry(user.uid, {
                                                     expenseId: expense.id,
                                                     amount: amt,
@@ -1060,12 +1118,12 @@ export default function ExpensesPage() {
             {/* ═══════════════════════════════════════════
                  SECTION 3: ONE-TIME PAYMENTS
                  ═══════════════════════════════════════════ */}
-            {oneTimeExpenses.length > 0 && (
+            {visibleOneTimeExpenses.length > 0 && (
                 <div className="card">
                     <h2 className="text-lg font-semibold text-slate-800 mb-4">One-Time Payments</h2>
                     <div className="space-y-3">
-                        {oneTimeExpenses.map((expense) => {
-                            const paid = entries.some((e) => e.expenseId === expense.id);
+                        {visibleOneTimeExpenses.map((expense) => {
+                            const paid = entries.some((e) => e.expenseId === expense.id && e.type !== 'set-aside');
                             return (
                                 <div
                                     key={expense.id}
@@ -1109,14 +1167,14 @@ export default function ExpensesPage() {
             {/* ═══════════════════════════════════════════
                  SECTION 4: FUTURE EXPENSES
                  ═══════════════════════════════════════════ */}
-            {futureExpenses.length > 0 && (
+            {visibleFutureExpenses.length > 0 && (
                 <div className="space-y-4">
                     <h2 className="text-lg font-semibold text-slate-800">Future Expenses</h2>
-                    {futureExpenses.map((expense) => {
+                    {visibleFutureExpenses.map((expense) => {
                         const total = expense.estimatedTotal ?? 0;
                         const wks = expense.deadline ? weeksUntil(expense.deadline) : 1;
                         const weeklyImpact = futureWeeklyImpact(expense);
-                        const expEntries = entriesForExpense(expense.id);
+                        const expEntries = entriesForExpense(expense.id).filter((entry) => entry.type !== 'set-aside');
                         const totalPaid = expEntries.reduce((sum, e) => sum + e.amount, 0);
                         const remaining = total - totalPaid;
                         const pct = total > 0 ? Math.min((totalPaid / total) * 100, 100) : 0;
@@ -1173,7 +1231,16 @@ export default function ExpensesPage() {
                                                 const [ey, em, ed] = entryDate.split('-').map(Number);
                                                 const entryDateObj = new Date(ey, em - 1, ed);
                                                 const amt = parseFloat(entryAmount);
+                                                if (isNaN(amt) || amt <= 0) return;
                                                 const acc = accounts.find((a) => a.id === payFromAccount);
+                                                if (acc) {
+                                                    const converted = acc.currency === 'OMR' ? amt : await convert(amt, 'OMR', acc.currency);
+                                                    const available = depositBalanceOf(acc.id);
+                                                    if (converted > available) {
+                                                        alert(`Insufficient deposit in ${acc.name}. Available: ${formatOMR(await convert(available, acc.currency, 'OMR'))}`);
+                                                        return;
+                                                    }
+                                                }
                                                 const entryRef = await addExpenseEntry(user.uid, {
                                                     expenseId: expense.id,
                                                     amount: amt,

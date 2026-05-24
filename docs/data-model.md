@@ -22,6 +22,7 @@ users/{userId}/
 │   └── current          Single document for weekly/monthly targets
 └── settings/
     ├── income           Single document for income config
+  ├── manualGoalsOverrides  Single document containing per-week saved overrides keyed by week start (`YYYY-MM-DD`)
     └── smsApiKey        API key for SMS auto-tracking
 ```
 
@@ -74,6 +75,7 @@ users/{userId}/
 }
 ```
 
+
 ### Transaction
 
 ```typescript
@@ -83,10 +85,14 @@ users/{userId}/
   amount: number;           // Positive = deposit/save, negative = withdrawal
   bucket: 'deposit' | 'saving';
   date: Date;               // Firestore Timestamp, converted on read
-  notes?: string;
+  notes?: string;           // For account resets, notes = 'Account reset to statement'
   createdAt: Timestamp;
 }
 ```
+
+#### Account Reset Adjustment
+- When the Reset Accounts panel is used, adjustment transactions are created for each account/bucket to match the entered statement.
+- These transactions have notes: 'Account reset to statement' and are dated at the start of the current week.
 
 ### Goals
 
@@ -111,6 +117,18 @@ Single document at `goals/current`.
 ```
 
 Single document at `settings/income`.
+
+### ManualGoalsOverrides
+
+```typescript
+{
+  overrides: Record<string, number>; // weekStart -> saved amount in OMR
+  updatedAt: string;                 // ISO string
+}
+```
+
+Single document at `settings/manualGoalsOverrides`.
+Each key in `overrides` is a Saturday week start in `YYYY-MM-DD` format.
 
 ### Loan
 

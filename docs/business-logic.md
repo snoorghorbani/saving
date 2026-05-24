@@ -58,8 +58,16 @@ Every expense payment (non-set-aside) must specify which account it comes from:
 - The expenses page has a global "Pay From" account selector.
 - When a payment entry is created, a matching **withdrawal transaction** is automatically created on that account's **deposit bucket**.
 - If the account is in a different currency than OMR, the amount is converted using live exchange rates.
+- New payments are blocked when the selected account's deposit balance is insufficient.
 - Undoing a payment or deleting an entry also deletes the linked withdrawal transaction.
+- Editing an existing payment entry updates the linked withdrawal transaction amount to keep deposit balances consistent.
 - The link is tracked via `[entry:{entryId}]` in the transaction's notes field.
+
+### SMS Expense Currency Handling
+- SMS parser extracts the transaction currency from the message text.
+- SMS expense entries are stored in OMR by converting from the parsed SMS currency.
+- Linked deposit withdrawals are converted to the selected account's currency before writing the transaction.
+- The original SMS amount and currency are kept in notes (for example `SMS 10 USD`) for auditability.
 
 ## Savings
 
@@ -84,12 +92,20 @@ Move money between any combination of account + bucket:
 - Different accounts, same or different buckets.
 - Cross-currency transfers auto-convert using live exchange rates.
 - Creates two transactions: a debit (negative) on the source and a credit (positive) on the destination.
+- Transfers are blocked when the source bucket has insufficient balance.
+
 
 ### Balance Calculation
 - Account total = sum of all transactions for that account.
 - Deposit balance = sum of transactions where `bucket = 'deposit'`.
 - Saving balance = sum of transactions where `bucket = 'saving'`.
 - Dashboard totals convert all accounts to OMR (or USD) using live rates.
+
+### Account Reset/Reconciliation
+- The Reset Accounts panel allows the user to enter the current statement for each account and bucket.
+- The app calculates the difference between the entered value and the current balance for each account/bucket.
+- It creates adjustment transactions (positive or negative) dated at the start of the current week, so balances match the statement.
+- This does not affect past transactions, only brings the present up to date.
 
 ### Loans from Savings
 Users can take a loan against their savings:
@@ -98,6 +114,7 @@ Users can take a loan against their savings:
 - Creates a withdrawal transaction from the source account's saving bucket, a deposit transaction into the destination account's deposit bucket, and a Loan record with the principal and balance.
 - **Repayment**: Partial or full repayments can be made at any time.
 - Each repayment deposits back into the source account's saving bucket and withdraws from the destination account's deposit bucket, and creates a LoanRepayment record.
+- Repayments are blocked when the destination account's deposit bucket does not have enough funds.
 - Outstanding balance = `principal − sum(repayments)`.
 - The Loan's `balance` field is also updated for convenience, but the authoritative balance is always computed from repayments.
 - **Dashboard**: Outstanding loans are displayed below the top-row cards showing "From → To" with a link to repay.

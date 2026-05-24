@@ -12,6 +12,8 @@ import type { Goals, Transaction, Account } from '@/types';
 import { formatOMR } from '@/lib/utils';
 import { formatCurrency, convert } from '@/lib/currency';
 import { ProgressBar } from '@/components/ProgressBar';
+import { getAllManualWeekOverrides, setManualWeekOverride, clearManualWeekOverride } from '@/lib/services/goals';
+import { savingsWeekKey } from '@/lib/savings-debt';
 
 export default function GoalsPage() {
     const { user, effectiveUserId, isViewer } = useAuth();
@@ -25,6 +27,11 @@ export default function GoalsPage() {
     const [convertedMonth, setConvertedMonth] = useState<number | null>(null);
     const [pastWeeks, setPastWeeks] = useState<{ label: string; saved: number }[]>([]);
     const [pastMonths, setPastMonths] = useState<{ label: string; saved: number }[]>([]);
+    // Per-week manual overrides
+    const [manualWeekOverrides, setManualWeekOverrides] = useState<Record<string, number>>({});
+    const [editingWeekKey, setEditingWeekKey] = useState<string | null>(null);
+    const [editingWeekValue, setEditingWeekValue] = useState('');
+    const [weekOverrideLoading, setWeekOverrideLoading] = useState(false);
 
     useEffect(() => {
         if (!effectiveUserId) return;
@@ -37,6 +44,8 @@ export default function GoalsPage() {
         });
         const unsub2 = subscribeToTransactions(effectiveUserId, setTransactions);
         const unsub3 = subscribeToAccounts(effectiveUserId, setAccounts);
+        // Load all per-week overrides
+        getAllManualWeekOverrides(effectiveUserId).then(setManualWeekOverrides);
         return () => {
             unsub1();
             unsub2();
@@ -142,12 +151,14 @@ export default function GoalsPage() {
             <div className="flex items-center justify-between">
                 <h1 className="text-2xl font-bold text-slate-900">Goals</h1>
                 {!isViewer && (
-                    <button
-                        onClick={() => setEditing(!editing)}
-                        className="btn-primary"
-                    >
-                        {editing ? 'Cancel' : goals ? 'Edit Goals' : 'Set Goals'}
-                    </button>
+                    <div className="flex gap-2">
+                        <button
+                            onClick={() => setEditing(!editing)}
+                            className="btn-primary"
+                        >
+                            {editing ? 'Cancel' : goals ? 'Edit Goals' : 'Set Goals'}
+                        </button>
+                    </div>
                 )}
             </div>
 
@@ -289,19 +300,74 @@ export default function GoalsPage() {
                     <h3 className="font-semibold text-slate-800 mb-3">Past Weeks</h3>
                     <div className="space-y-2">
                         {pastWeeks.map((w, i) => {
-                            const pct = goals.weeklyTarget ? (w.saved / goals.weeklyTarget) * 100 : 0;
+                            const weekStart = new Date(w.label.split('–')[0].trim() + ' ' + new Date().getFullYear());
+                            const key = savingsWeekKey(weekStart);
+                            const override = manualWeekOverrides[key];
+                            const value = override !== undefined ? override : w.saved;
+                            const pct = goals.weeklyTarget ? (value / goals.weeklyTarget) * 100 : 0;
                             const hit = pct >= 100;
+                            const isEditing = editingWeekKey === key;
                             return (
                                 <div key={i}>
                                     <div className="flex items-center justify-between text-sm mb-1">
                                         <span className="text-slate-500">{w.label}</span>
                                         <span className={hit ? 'text-emerald-600 font-medium' : 'text-slate-600'}>
-                                            {formatOMR(w.saved)}
+                                            {formatOMR(value)}
                                             {goals.weeklyTarget > 0 && (
                                                 <span className="text-xs text-slate-400 ml-1">/ {formatOMR(goals.weeklyTarget)}</span>
                                             )}
                                             {hit && ' ✓'}
                                         </span>
+                                        {!isViewer && (
+                                            isEditing ? (
+                                                <>
+                                                    <input
+                                                        type="number"
+                                                        step="0.001"
+                                                        className="input w-20 ml-2"
+                                                        value={editingWeekValue}
+                                                        onChange={e => setEditingWeekValue(e.target.value)}
+                                                        placeholder="Saved"
+                                                        disabled={weekOverrideLoading}
+                                                    />
+                                                    <button
+                                                        className="btn-primary text-xs ml-1"
+                                                        disabled={weekOverrideLoading}
+                                                        onClick={async () => {
+                                                            if (!user) return;
+                                                            setWeekOverrideLoading(true);
+                                                            await setManualWeekOverride(user.uid, key, parseFloat(editingWeekValue) || 0);
+                                                            setManualWeekOverrides({ ...manualWeekOverrides, [key]: parseFloat(editingWeekValue) || 0 });
+                                                            setEditingWeekKey(null);
+                                                            setWeekOverrideLoading(false);
+                                                        }}
+                                                    >Save</button>
+                                                    <button
+                                                        className="btn-secondary text-xs ml-1"
+                                                        disabled={weekOverrideLoading}
+                                                        onClick={async () => {
+                                                            if (!user) return;
+                                                            setWeekOverrideLoading(true);
+                                                            await clearManualWeekOverride(user.uid, key);
+                                                            const copy = { ...manualWeekOverrides };
+                                                            delete copy[key];
+                                                            setManualWeekOverrides(copy);
+                                                            setEditingWeekKey(null);
+                                                            setWeekOverrideLoading(false);
+                                                        }}
+                                                    >Clear</button>
+                                                    <button
+                                                        className="btn-secondary text-xs ml-1"
+                                                        onClick={() => setEditingWeekKey(null)}
+                                                    >Cancel</button>
+                                                </>
+                                            ) : (
+                                                <button
+                                                    className="btn-secondary text-xs ml-2"
+                                                    onClick={() => { setEditingWeekKey(key); setEditingWeekValue((override ?? w.saved).toString()); }}
+                                                >Edit</button>
+                                            )
+                                        )}
                                     </div>
                                     <ProgressBar
                                         value={Math.min(pct, 100)}

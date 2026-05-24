@@ -20,6 +20,7 @@ import {
     subscribeToGoals,
 } from '@/lib/firestore';
 import type { Transaction, Account, AccountType, Currency, Bucket, Loan, LoanRepayment } from '@/types';
+import { resetAccountsToStatement } from '@/lib/services/savings';
 import { CURRENCIES } from '@/types';
 import { formatCurrency, convert } from '@/lib/currency';
 import {
@@ -33,6 +34,35 @@ export default function SavingsPage() {
     const { user, effectiveUserId, isViewer } = useAuth();
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     const [accounts, setAccounts] = useState<Account[]>([]);
+    const [showResetPanel, setShowResetPanel] = useState(false);
+    const [resetInputs, setResetInputs] = useState<{ [accountId: string]: { deposit: string; saving: string } }>({});
+    const [resetLoading, setResetLoading] = useState(false);
+    // Handle Reset Accounts
+    const handleResetInput = (accountId: string, bucket: Bucket, value: string) => {
+        setResetInputs((prev) => ({
+            ...prev,
+            [accountId]: {
+                deposit: bucket === 'deposit' ? value : prev[accountId]?.deposit || '',
+                saving: bucket === 'saving' ? value : prev[accountId]?.saving || '',
+            },
+        }));
+    };
+
+    const handleResetAccounts = async (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!user || isViewer) return;
+        setResetLoading(true);
+        const statementInputs = accounts.map((acc) => ({
+            accountId: acc.id,
+            deposit: parseFloat(resetInputs[acc.id]?.deposit || '0') || 0,
+            saving: parseFloat(resetInputs[acc.id]?.saving || '0') || 0,
+        }));
+        await resetAccountsToStatement(user.uid, accounts, transactions, statementInputs);
+        setShowResetPanel(false);
+        setResetInputs({});
+        setResetLoading(false);
+        alert('Accounts have been reset to your statement.');
+    };
     const [showForm, setShowForm] = useState(false);
     const [showAccountForm, setShowAccountForm] = useState(false);
     const [showTransferForm, setShowTransferForm] = useState(false);
@@ -135,6 +165,14 @@ export default function SavingsPage() {
         const localDate = new Date(y, m - 1, d);
         const parsedAmount = parseFloat(amount);
         if (isNaN(parsedAmount) || parsedAmount === 0) return;
+        if (!editingTxnId && parsedAmount < 0) {
+            const available = balanceOf(accountId, bucket);
+            if (Math.abs(parsedAmount) > available) {
+                const acc = accounts.find((a) => a.id === accountId);
+                alert(`Insufficient ${bucket}. Available: ${formatCurrency(available, acc?.currency ?? 'OMR')}`);
+                return;
+            }
+        }
         if (editingTxnId) {
             await updateTransaction(user.uid, editingTxnId, {
                 accountId,
@@ -313,6 +351,11 @@ export default function SavingsPage() {
         if (!fromAcc || !toAcc) return;
         const amt = parseFloat(transferAmount);
         if (isNaN(amt) || amt <= 0) return;
+        const available = balanceOf(transferFrom, transferFromBucket);
+        if (amt > available) {
+            alert(`Insufficient ${transferFromBucket}. Available: ${formatCurrency(available, fromAcc.currency)}`);
+            return;
+        }
         const convertedAmt = await convert(amt, fromAcc.currency, toAcc.currency);
         const label = `Transfer: ${fromAcc.name}/${transferFromBucket} → ${toAcc.name}/${transferToBucket}`;
         if (!confirm(`Transfer ${formatCurrency(amt, fromAcc.currency)} from ${fromAcc.name} (${transferFromBucket}) → ${formatCurrency(convertedAmt, toAcc.currency)} to ${toAcc.name} (${transferToBucket})?`)) return;
@@ -426,6 +469,13 @@ export default function SavingsPage() {
             alert(`Repayment exceeds outstanding balance of ${formatCurrency(remaining, fromAcc.currency)}`);
             return;
         }
+        if (toAcc) {
+            const toDepositBal = balanceOf(toAcc.id, 'deposit');
+            if (amt > toDepositBal) {
+                alert(`Insufficient deposit in ${toAcc.name}. Available: ${formatCurrency(toDepositBal, toAcc.currency)}`);
+                return;
+            }
+        }
         if (!confirm(`Repay ${formatCurrency(amt, fromAcc.currency)} toward loan from ${fromAcc.name}?`)) return;
         const [ry, rm, rd] = repayDate.split('-').map(Number);
         const rLocalDate = new Date(ry, rm - 1, rd);
@@ -498,6 +548,64 @@ export default function SavingsPage() {
                         >
                             Transfer
                         </button>
+                        <button
+                            onClick={() => { setShowResetPanel(!showResetPanel); setShowForm(false); setShowTransferForm(false); setShowLoanForm(false); }}
+                            className="btn-secondary"
+                            disabled={accounts.length < 1}
+                        >
+                            Reset Accounts
+                        </button>
+                        {/* ── Reset Accounts Panel ───────────────────── */}
+                        {showResetPanel && !isViewer && (
+                            <div className="card">
+                                <h2 className="text-lg font-semibold text-slate-800 mb-4">Reset Accounts to Statement</h2>
+                                <form onSubmit={handleResetAccounts} className="space-y-4">
+                                    <p className="text-sm text-slate-600 mb-2">Enter the current balance for each account and bucket as of now. This will create adjustment transactions at the start of this week.</p>
+                                    <div className="overflow-x-auto">
+                                        <table className="min-w-full border text-xs">
+                                            <thead>
+                                                <tr className="bg-slate-50">
+                                                    <th className="px-2 py-1 border">Account</th>
+                                                    <th className="px-2 py-1 border">Deposit</th>
+                                                    <th className="px-2 py-1 border">Saving</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                {accounts.map((acc) => (
+                                                    <tr key={acc.id}>
+                                                        <td className="px-2 py-1 border font-medium">{acc.name} <span className="text-slate-400">({acc.currency})</span></td>
+                                                        <td className="px-2 py-1 border">
+                                                            <input
+                                                                type="number"
+                                                                step="0.001"
+                                                                className="input w-24"
+                                                                value={resetInputs[acc.id]?.deposit ?? ''}
+                                                                onChange={(e) => handleResetInput(acc.id, 'deposit', e.target.value)}
+                                                                placeholder="Deposit"
+                                                            />
+                                                        </td>
+                                                        <td className="px-2 py-1 border">
+                                                            <input
+                                                                type="number"
+                                                                step="0.001"
+                                                                className="input w-24"
+                                                                value={resetInputs[acc.id]?.saving ?? ''}
+                                                                onChange={(e) => handleResetInput(acc.id, 'saving', e.target.value)}
+                                                                placeholder="Saving"
+                                                            />
+                                                        </td>
+                                                    </tr>
+                                                ))}
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                    <div className="flex gap-2 mt-4">
+                                        <button type="submit" className="btn-primary" disabled={resetLoading}>{resetLoading ? 'Resetting...' : 'Reset Accounts'}</button>
+                                        <button type="button" onClick={() => setShowResetPanel(false)} className="btn-secondary">Cancel</button>
+                                    </div>
+                                </form>
+                            </div>
+                        )}
                         <button
                             onClick={() => { setShowLoanForm(!showLoanForm); setShowForm(false); setShowTransferForm(false); }}
                             className="btn-secondary"

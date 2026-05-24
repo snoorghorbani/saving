@@ -57,6 +57,10 @@ A toggle button switches all 6 cards between OMR and USD display.
 - Shows the user's Firebase UID for inclusion in requests.
 - Provides step-by-step iOS Shortcut setup instructions.
 - The Cloud Function (`functions/index.js`) parses bank SMS messages, extracts amount/merchant/date, and creates expense entries in Firestore.
+- Currency is parsed from the SMS (e.g., OMR, USD, AED, EUR, TRY, GBP, SAR, INR).
+- SMS expenses are stored as OMR in `expenseEntries` (converted from the SMS currency).
+- The linked account deduction is converted from SMS currency to that account's currency (for example, USD SMS on an OMR account is deducted in OMR).
+- The original SMS amount/currency is preserved in notes for traceability.
 - Matches merchant names to existing expenses (case-insensitive) or falls back to an "SMS Expenses" catch-all expense.
 - API key stored in `users/{userId}/settings/smsApiKey`.
 
@@ -66,6 +70,13 @@ A toggle button switches all 6 cards between OMR and USD display.
 - **Saved This Week**: Total savings (all buckets) this week.
 - **Saved This Month**: Total savings this month.
 - **Expenses Till End of 2026**: Projected total (fixed + one-time + future).
+
+
+### Reset Accounts Panel
+
+- **Reset Accounts**: Button on the Savings page opens a panel where you can enter the current balance for each account and bucket (deposit/saving).
+- When submitted, the app creates adjustment transactions at the start of the current week so that each account/bucket matches your statement.
+- This is for regaining control after a period of untracked changes or reconciliation.
 
 ### Savings Goals Progress (2 cards)
 
@@ -122,6 +133,7 @@ All kinds support: notes, unexpected flag.
 - Lists all savings accounts with their currency.
 - All payments (mark as paid, manual entries) withdraw from the selected account's deposit bucket.
 - Automatically creates a paired withdrawal transaction when a payment is logged.
+- Payment actions are blocked when the selected account's deposit balance is insufficient.
 - Currency conversion applied when account currency differs from OMR.
 
 ### Weekly Summary (5 cards)
@@ -150,8 +162,8 @@ Expandable cards for each budget category:
 
 ### One-Time Payments Section
 
-- List of planned one-time expenses.
-- Status: unpaid or paid (with checkmark).
+- List of planned one-time expenses that are still unpaid.
+- Paid one-time expenses are hidden from the section once an expense entry exists.
 - Mark as paid, edit, delete.
 
 ### Future Expenses Section
@@ -159,6 +171,7 @@ Expandable cards for each budget category:
 - Shows estimated total, weekly portion, payments made.
 - Progress bar toward estimated total.
 - Set-aside button for weekly advance payments.
+- Fully paid future expenses are hidden from the section.
 - Edit/delete.
 
 ### Unexpected Expenses Section
@@ -203,6 +216,7 @@ Each account shows:
 - Amount in source currency.
 - Real-time preview of converted amount if currencies differ.
 - Creates paired transactions (debit + credit).
+- Transfer is blocked when the source bucket balance is insufficient.
 
 ### Loan from Savings
 
@@ -218,6 +232,7 @@ Each account shows:
 - Repayment history displayed per loan.
 - "Make Repayment" button opens inline form: amount, date, notes.
 - Repayment deposits back into the saving bucket and records a LoanRepayment.
+- Repayment is blocked when the destination deposit bucket balance is insufficient.
 - Loan balance updated on repayment.
 
 ### Settled Loans
@@ -229,6 +244,7 @@ Each account shows:
 - Filterable by account (dropdown) or show all.
 - Each row: account name, bucket badge (blue for deposit, green for saving), date, notes, amount.
 - Edit and delete buttons per transaction.
+- New manual withdrawals are blocked when the selected bucket balance is insufficient.
 
 ## Goals Page (`/dashboard/goals`)
 
@@ -245,6 +261,11 @@ Savings target tracking with history.
   - Shows current week date range (e.g., "Apr 5 – Apr 11").
 - **Monthly Savings Goal**: Target, saved this month, progress bar, ahead/remaining.
   - Shows current month name (e.g., "April 2026").
+
+### Past Week Adjustments
+
+- Past Weeks rows can be edited individually to store a manual saved amount for a specific week.
+- Per-week history overrides are stored separately from transactions and only affect goal history display.
 
 ### Progress Bar Colors
 
